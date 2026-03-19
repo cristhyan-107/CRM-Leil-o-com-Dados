@@ -48,6 +48,13 @@ export function PdfButton({
         '--accent': '#f1f5f9', '--accent-foreground': '#0f172a',
         '--destructive': '#ef4444', '--border': '#e2e8f0',
         '--input': '#e2e8f0', '--ring': '#3b82f6',
+        '--chart-1': '#3b82f6', '--chart-2': '#22c55e',
+        '--chart-3': '#f59e0b', '--chart-4': '#a855f7',
+        '--chart-5': '#ef4444', '--sidebar': '#f8fafc',
+        '--sidebar-foreground': '#0f172a', '--sidebar-primary': '#2563eb',
+        '--sidebar-primary-foreground': '#ffffff', '--sidebar-accent': '#f1f5f9',
+        '--sidebar-accent-foreground': '#0f172a', '--sidebar-border': '#e2e8f0',
+        '--sidebar-ring': '#3b82f6',
       };
       
       Object.entries(safeVars).forEach(([key, value]) => {
@@ -60,19 +67,26 @@ export function PdfButton({
         const computedStyle = window.getComputedStyle(htmlEl);
         
         // Check for unsupported color formats in computed styles and replace them
-        const checkAndReplaceColor = (prop: 'color' | 'backgroundColor' | 'borderColor') => {
-          const val = computedStyle[prop];
-          if (val && (val.includes('oklch') || val.includes('lab') || val.includes('lch'))) {
+        const checkAndReplaceColor = (prop: any) => {
+          const val = computedStyle[prop as keyof CSSStyleDeclaration] as string;
+          if (val && (val.includes('oklch') || val.includes('lab') || val.includes('lch') || val.includes('color(display-p3'))) {
             // Fallbacks based on common classes or default to safe colors
             if (prop === 'color') htmlEl.style.color = '#1a1a1a';
-            if (prop === 'backgroundColor') htmlEl.style.backgroundColor = val.includes('transparent') ? 'transparent' : '#ffffff';
-            if (prop === 'borderColor') htmlEl.style.borderColor = '#e2e8f0';
+            else if (prop === 'backgroundColor') htmlEl.style.backgroundColor = val.includes('transparent') ? 'transparent' : '#ffffff';
+            else if (prop.includes('border') || prop.includes('outline')) (htmlEl.style as any)[prop] = '#e2e8f0';
+            else if (prop === 'fill') htmlEl.style.fill = '#3b82f6';
+            else if (prop === 'stroke') htmlEl.style.stroke = 'currentColor';
+            else if (prop === 'boxShadow') htmlEl.style.boxShadow = 'none';
+            else (htmlEl.style as any)[prop] = ''; // Just clear it if unknown
           }
         };
 
-        checkAndReplaceColor('color');
-        checkAndReplaceColor('backgroundColor');
-        checkAndReplaceColor('borderColor');
+        const colorProps = [
+          'color', 'backgroundColor', 'borderColor', 'borderTopColor', 
+          'borderRightColor', 'borderBottomColor', 'borderLeftColor',
+          'fill', 'stroke', 'outlineColor', 'boxShadow', 'textDecorationColor'
+        ];
+        colorProps.forEach(checkAndReplaceColor);
 
         // Apply white-background theme overrides mapping tailwind classes to hex
         const className = htmlEl.className || '';
