@@ -4,6 +4,8 @@ export const metadata: Metadata = {
   title: 'Autenticação - Leilão Ágil',
 };
 
+export const dynamic = 'force-dynamic';
+
 export default function AuthLayout({ children }: { children: React.ReactNode }) {
   return (
     <div className="dark min-h-screen flex items-center justify-center bg-[#060a14] relative overflow-hidden">
