@@ -15,9 +15,11 @@ export default async function PublicReportPage({ params }: { params: Promise<{ t
   const { token } = await params;
   
   // Create an admin client to bypass RLS for public shared reports
+  // If the service role key is not defined in Vercel, fallback to anon key to prevent 500 crash
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
   const supabaseAdmin = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!
+    supabaseKey
   );
 
   const { data: report } = await supabaseAdmin
