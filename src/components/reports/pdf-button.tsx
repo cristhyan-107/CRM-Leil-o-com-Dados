@@ -37,42 +37,57 @@ export function PdfButton({
       clone.style.color = '#1a1a1a';
       clone.style.padding = '24px';
       
-      // Override all child element colors for PDF readability
-      clone.querySelectorAll('*').forEach((el) => {
+      // Override CSS custom properties that use OKLCH format for safe HEX/RGB
+      const safeVars = {
+        '--background': '#ffffff', '--foreground': '#0f172a',
+        '--card': '#ffffff', '--card-foreground': '#0f172a',
+        '--popover': '#ffffff', '--popover-foreground': '#0f172a',
+        '--primary': '#2563eb', '--primary-foreground': '#ffffff',
+        '--secondary': '#f1f5f9', '--secondary-foreground': '#0f172a',
+        '--muted': '#f8fafc', '--muted-foreground': '#64748b',
+        '--accent': '#f1f5f9', '--accent-foreground': '#0f172a',
+        '--destructive': '#ef4444', '--border': '#e2e8f0',
+        '--input': '#e2e8f0', '--ring': '#3b82f6',
+      };
+      
+      Object.entries(safeVars).forEach(([key, value]) => {
+        clone.style.setProperty(key, value);
+      });
+
+      // Force inline safe colors to avoid html2canvas crashing on modern CSS colors (oklch, lab)
+      clone.querySelectorAll('*').forEach((el: Element) => {
         const htmlEl = el as HTMLElement;
         const computedStyle = window.getComputedStyle(htmlEl);
         
-        // Make dark text colors readable
-        if (computedStyle.color) {
-          const rgb = computedStyle.color;
-          // If text is very light (for dark mode), make it dark
-          if (rgb.includes('rgba') && rgb.includes(', 0)')) return; // skip transparent
-          htmlEl.style.color = htmlEl.style.color || '';
+        // Check for unsupported color formats in computed styles and replace them
+        const checkAndReplaceColor = (prop: 'color' | 'backgroundColor' | 'borderColor') => {
+          const val = computedStyle[prop];
+          if (val && (val.includes('oklch') || val.includes('lab') || val.includes('lch'))) {
+            // Fallbacks based on common classes or default to safe colors
+            if (prop === 'color') htmlEl.style.color = '#1a1a1a';
+            if (prop === 'backgroundColor') htmlEl.style.backgroundColor = val.includes('transparent') ? 'transparent' : '#ffffff';
+            if (prop === 'borderColor') htmlEl.style.borderColor = '#e2e8f0';
+          }
+        };
+
+        checkAndReplaceColor('color');
+        checkAndReplaceColor('backgroundColor');
+        checkAndReplaceColor('borderColor');
+
+        // Apply white-background theme overrides mapping tailwind classes to hex
+        const className = htmlEl.className || '';
+        if (typeof className === 'string') {
+          if (className.includes('text-white') || className.includes('text-gray-200')) htmlEl.style.color = '#1a1a1a';
+          if (className.includes('text-gray-400')) htmlEl.style.color = '#4a5568';
+          if (className.includes('text-blue-')) htmlEl.style.color = '#2563eb';
+          if (className.includes('text-emerald-')) htmlEl.style.color = '#059669';
+          if (className.includes('bg-[#') || className.includes('bg-gray-800') || className.includes('bg-gray-900')) htmlEl.style.backgroundColor = '#ffffff';
+          if (className.includes('border-white') || className.includes('border-gray-800')) htmlEl.style.borderColor = '#e2e8f0';
         }
       });
 
-      // Apply white-background theme overrides
-      clone.querySelectorAll('[class*="text-white"]').forEach(el => {
-        (el as HTMLElement).style.color = '#1a1a1a';
-      });
-      clone.querySelectorAll('[class*="text-gray-"]').forEach(el => {
-        (el as HTMLElement).style.color = '#4a5568';
-      });
-      clone.querySelectorAll('[class*="text-blue-"]').forEach(el => {
-        (el as HTMLElement).style.color = '#2563eb';
-      });
-      clone.querySelectorAll('[class*="text-emerald-"]').forEach(el => {
-        (el as HTMLElement).style.color = '#059669';
-      });
-      clone.querySelectorAll('[class*="bg-[#"]').forEach(el => {
-        (el as HTMLElement).style.backgroundColor = '#ffffff';
-      });
-      clone.querySelectorAll('[class*="border-white"]').forEach(el => {
-        (el as HTMLElement).style.borderColor = '#e2e8f0';
-      });
-
       // Hide print:hidden elements
-      clone.querySelectorAll('.print\\:hidden, [class*="print:hidden"]').forEach(el => {
+      clone.querySelectorAll('.print\\:hidden, [class*="print:hidden"]').forEach((el: Element) => {
         (el as HTMLElement).style.display = 'none';
       });
 
