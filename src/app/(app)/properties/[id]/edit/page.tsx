@@ -65,13 +65,17 @@ export default function EditPropertyPage() {
       status: (form.get('status') as string) || 'available',
     };
 
-    const { error: updateError } = await supabase
+    const { data: updateData, error: updateError } = await supabase
       .from('properties')
       .update(updates)
-      .eq('id', propertyId);
+      .eq('id', propertyId)
+      .select();
 
     if (updateError) {
       setError(updateError.message);
+      setSaving(false);
+    } else if (!updateData || updateData.length === 0) {
+      setError('A edição falhou: O imóvel não foi encontrado ou você não tem permissão.');
       setSaving(false);
     } else {
       router.push('/properties');
@@ -84,13 +88,18 @@ export default function EditPropertyPage() {
     setDeleting(true);
     setError('');
     
-    const { error: deleteError } = await supabase
+    // Usa soft delete (atualizando deleted_at) pois o imóvel pode ter leads e gerar erro de Foreign Key
+    const { data: deleteData, error: deleteError } = await supabase
       .from('properties')
-      .delete()
-      .eq('id', propertyId);
+      .update({ deleted_at: new Date().toISOString(), status: 'inactive' })
+      .eq('id', propertyId)
+      .select();
       
     if (deleteError) {
       setError('Erro ao excluir: ' + deleteError.message);
+      setDeleting(false);
+    } else if (!deleteData || deleteData.length === 0) {
+      setError('A exclusão falhou: O imóvel não foi encontrado ou você não tem permissão.');
       setDeleting(false);
     } else {
       router.push('/properties');

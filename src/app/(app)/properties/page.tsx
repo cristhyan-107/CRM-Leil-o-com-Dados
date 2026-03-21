@@ -3,6 +3,7 @@ import { Plus, Home, MapPin, DollarSign, Edit2 } from 'lucide-react';
 import Link from 'next/link';
 
 export const metadata = { title: 'Imóveis - Leilão Ágil' };
+export const dynamic = 'force-dynamic';
 
 export default async function PropertiesPage() {
   const supabase = await createServerSupabase();
