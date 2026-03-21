@@ -1,5 +1,5 @@
 import { createServerSupabase } from '@/lib/supabase/server';
-import { Plus, Home, MapPin, DollarSign } from 'lucide-react';
+import { Plus, Home, MapPin, DollarSign, Edit2 } from 'lucide-react';
 import Link from 'next/link';
 
 export const metadata = { title: 'Imóveis - Leilão Ágil' };
@@ -37,6 +37,7 @@ export default async function PropertiesPage() {
                   <th scope="col" className="px-6 py-4 font-medium">Localização</th>
                   <th scope="col" className="px-6 py-4 font-medium">Preço</th>
                   <th scope="col" className="px-6 py-4 font-medium">Status</th>
+                  <th scope="col" className="px-6 py-4 font-medium text-right">Ações</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/5">
@@ -74,6 +75,15 @@ export default async function PropertiesPage() {
                         {property.status === 'available' ? 'Disponível' : 
                          property.status === 'sold' ? 'Vendido' : 'Indisponível'}
                       </span>
+                    </td>
+                    <td className="px-6 py-4 text-right">
+                      <Link 
+                        href={`/properties/${property.id}/edit`}
+                        className="inline-flex items-center justify-center p-2 text-gray-400 hover:text-white hover:bg-white/10 rounded-lg transition-colors"
+                        title="Editar imóvel"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                      </Link>
                     </td>
                   </tr>
                 ))}
