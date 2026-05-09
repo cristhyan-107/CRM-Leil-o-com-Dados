@@ -51,6 +51,40 @@ export type InstanceResolution = {
   warning?: string;
 };
 
+function getFriendlyEvolutionError(error: unknown, fallback = 'Erro ao consultar Evolution API') {
+  if (!process.env.EVOLUTION_API_KEY) return 'EVOLUTION_API_KEY ausente ou inválida';
+
+  const status = error instanceof EvolutionApiError
+    ? error.status
+    : typeof (error as any)?.status === 'number'
+    ? (error as any).status
+    : undefined;
+  const details = [
+    error instanceof EvolutionApiError ? error.message : '',
+    error instanceof EvolutionApiError ? error.body : '',
+    error instanceof Error ? error.message : '',
+    typeof error === 'string' ? error : '',
+  ].join(' ').toLowerCase();
+
+  if (status === 401 || status === 403 || details.includes('unauthorized') || details.includes('forbidden')) {
+    return 'EVOLUTION_API_KEY ausente ou inválida';
+  }
+  if (status === 404 || details.includes('not found') || details.includes('not exist')) {
+    return 'Instância não encontrada na Evolution';
+  }
+  if (
+    details.includes('fetch failed') ||
+    details.includes('econnrefused') ||
+    details.includes('enotfound') ||
+    details.includes('timeout') ||
+    details.includes('network')
+  ) {
+    return 'Evolution API fora do ar ou inacessível';
+  }
+
+  return fallback;
+}
+
 async function evolutionInstanceExists(instanceName: string): Promise<boolean> {
   const status = await getEvolutionInstanceStatus(instanceName);
   const state = status?.instance?.state || status?.state || status?.status;
@@ -525,6 +559,7 @@ export async function syncWhatsAppChats(): Promise<{
   statusCode?: number;
   details?: string;
   error?: string;
+  userMessage?: string;
 }> {
   let instanceName = '';
   let instanceNameSource: InstanceResolutionSource = 'fallback';
@@ -645,6 +680,7 @@ export async function syncWhatsAppChats(): Promise<{
     return { success: true, status: 'completed', count: chatsImported, summary };
   } catch (error: any) {
     const message = error?.message || 'Erro desconhecido na sincronizacao';
+    const userMessage = getFriendlyEvolutionError(error);
     logSyncError('failed', error, { instanceName });
     if (instanceName) await saveSyncError(instanceName, message);
     return {
@@ -654,6 +690,7 @@ export async function syncWhatsAppChats(): Promise<{
       instanceName,
       statusCode: typeof error?.status === 'number' ? error.status : undefined,
       error: 'Erro na sincronização. Verifique os detalhes nos logs do servidor.',
+      userMessage,
       details: message,
     };
   }

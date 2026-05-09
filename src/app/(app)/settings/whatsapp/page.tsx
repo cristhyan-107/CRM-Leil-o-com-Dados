@@ -103,7 +103,10 @@ export default function WhatsAppSettingsPage() {
     setSyncStatus('Atualizando webhook...');
 
     // IMPORTANTE: atualizar URL do webhook para Vercel
-    await updateWebhookUrl().catch(() => {});
+    const webhookRes = await updateWebhookUrl().catch((err) => ({
+      success: false,
+      error: err instanceof Error ? err.message : 'Webhook não configurado',
+    }));
 
     setSyncStatus('Sincronizando conversas...');
     const syncRes = await syncWhatsAppChats();
@@ -118,23 +121,30 @@ export default function WhatsAppSettingsPage() {
           : `Sincronização concluída: ${chats} conversas, ${messages} mensagens`
       );
       setSyncRefreshKey((value) => value + 1);
+      if (!webhookRes.success) {
+        setSyncStatus('Webhook não configurado');
+        setSyncError(
+          'As conversas foram sincronizadas, mas o webhook não foi atualizado. Novas mensagens podem não aparecer automaticamente.'
+        );
+      }
     } else {
       setSyncStatus('Erro na sincronização');
     }
 
     if (!syncRes.success) {
-      setSyncStatus(
+      const userMessage = syncRes.userMessage || (
         syncRes.stage?.toLowerCase().includes('database')
           ? 'Erro ao salvar conversas no banco'
           : 'Erro ao consultar Evolution API'
       );
+      setSyncStatus(userMessage);
       setSyncError(
         'Não foi possível buscar as conversas da Evolution API. Verifique se a instância está conectada e se o servidor está respondendo.'
       );
     }
 
     setState('OPEN');
-    if (syncRes.success) setTimeout(() => setSyncStatus(''), 5000);
+    if (syncRes.success && webhookRes.success) setTimeout(() => setSyncStatus(''), 5000);
   }
 
   // ============================================================

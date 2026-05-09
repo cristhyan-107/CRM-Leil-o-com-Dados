@@ -6,14 +6,64 @@ import {
   syncWhatsAppChats,
 } from '@/app/(app)/settings/whatsapp/actions';
 import {
+  EvolutionApiError,
+  evolutionFetch,
   getEvolutionChats,
   getEvolutionContacts,
-  getEvolutionInstanceStatus,
   getEvolutionMessages,
   getEvolutionUrl,
 } from '@/lib/evolution';
 
 export const dynamic = 'force-dynamic';
+
+type DebugStage =
+  | 'env'
+  | 'evolution.status'
+  | 'evolution.chats'
+  | 'evolution.contacts'
+  | 'evolution.messages'
+  | 'database';
+
+function stageError(
+  stage: DebugStage,
+  error: unknown,
+  resolvedInstanceName: string | null,
+  apiUrlReachable = false
+) {
+  const statusCode = error instanceof EvolutionApiError ? error.status : undefined;
+  const details = error instanceof EvolutionApiError
+    ? error.body
+    : error instanceof Error
+    ? error.message
+    : String(error);
+
+  return NextResponse.json(
+    {
+      success: false,
+      stage,
+      statusCode,
+      message: friendlyEvolutionError(stage, statusCode, details),
+      resolvedInstanceName,
+      apiUrlReachable,
+      details,
+    },
+    { status: 200 }
+  );
+}
+
+function friendlyEvolutionError(stage: DebugStage, statusCode?: number, details?: string) {
+  if (stage === 'env' && details?.includes('EVOLUTION_API_KEY')) {
+    return 'EVOLUTION_API_KEY ausente ou inválida.';
+  }
+  if (stage === 'env' && details?.includes('EVOLUTION_INSTANCE_NAME')) {
+    return 'EVOLUTION_INSTANCE_NAME ausente no ambiente.';
+  }
+  if (stage === 'env') return details || 'Variável de ambiente ausente.';
+  if (statusCode === 401 || statusCode === 403) return 'EVOLUTION_API_KEY ausente ou inválida.';
+  if (statusCode === 404) return 'Instância não encontrada na Evolution.';
+  if (details?.toLowerCase().includes('fetch')) return 'Evolution API fora do ar ou inacessível.';
+  return 'Erro ao consultar Evolution API.';
+}
 
 async function tableExists(admin: ReturnType<typeof createAdminClient>, table: string) {
   const { error } = await admin.from(table).select('id').limit(1);
@@ -68,6 +118,28 @@ export async function GET() {
     }
 
     const admin = createAdminClient();
+    const missingEnv = [
+      'EVOLUTION_API_URL',
+      'EVOLUTION_API_KEY',
+    ].filter((name) => !process.env[name]);
+
+    if (missingEnv.length > 0) {
+      return stageError(
+        'env',
+        new Error(
+          missingEnv.includes('EVOLUTION_INSTANCE_NAME')
+            ? 'EVOLUTION_INSTANCE_NAME ausente no ambiente.'
+            : `Variável de ambiente ausente: ${missingEnv.join(', ')}`
+        ),
+        null,
+        false
+      );
+    }
+
+    const envWarnings = !process.env.EVOLUTION_INSTANCE_NAME
+      ? ['EVOLUTION_INSTANCE_NAME ausente no ambiente.']
+      : [];
+
     const resolution = await resolveWhatsAppInstance();
     const instanceName = resolution.resolvedInstanceName;
     const instanceNameSource = resolution.source;
@@ -76,6 +148,8 @@ export async function GET() {
       userId: user.id,
       resolvedInstanceName: instanceName,
       instanceNameSource,
+      envInstanceNamePresent: Boolean(process.env.EVOLUTION_INSTANCE_NAME),
+      envWarnings,
       statusUrl: getEvolutionUrl(`/instance/connectionState/${instanceName}`),
       chatsUrl: getEvolutionUrl(`/chat/findChats/${instanceName}`),
     });
@@ -86,43 +160,53 @@ export async function GET() {
       .eq('instance_name', instanceName)
       .maybeSingle();
 
-    const statusPayload = await getEvolutionInstanceStatus(instanceName);
+    let statusPayload: any;
+    try {
+      statusPayload = await evolutionFetch(`/instance/connectionState/${instanceName}`);
+    } catch (error) {
+      return stageError('evolution.status', error, instanceName, true);
+    }
     const evolutionStatus =
       statusPayload?.instance?.state || statusPayload?.state || statusPayload?.status || 'unknown';
-    const evolutionReachable = !statusPayload?.error;
+    const evolutionReachable = true;
 
     let chatsFound = 0;
     let contactsFound = 0;
     let messagesFound = 0;
 
-    const chats = await getEvolutionChats(instanceName).catch((err) => {
-      errors.push(`chats: ${err?.message || String(err)}`);
-      return [];
-    });
+    let chats;
+    try {
+      chats = await getEvolutionChats(instanceName);
+    } catch (error) {
+      return stageError('evolution.chats', error, instanceName, true);
+    }
     chatsFound = chats.length;
 
-    const contacts = await getEvolutionContacts(instanceName).catch((err) => {
-      errors.push(`contacts: ${err?.message || String(err)}`);
-      return [];
-    });
+    let contacts;
+    try {
+      contacts = await getEvolutionContacts(instanceName);
+    } catch (error) {
+      return stageError('evolution.contacts', error, instanceName, true);
+    }
     contactsFound = contacts.length;
 
     if (chats[0]?.remoteJid) {
-      const messages = await getEvolutionMessages(instanceName, chats[0].remoteJid, 10).catch((err) => {
-        errors.push(`messages: ${err?.message || String(err)}`);
-        return [];
-      });
+      let messages;
+      try {
+        messages = await getEvolutionMessages(instanceName, chats[0].remoteJid, 10);
+      } catch (error) {
+        return stageError('evolution.messages', error, instanceName, true);
+      }
       messagesFound = messages.length;
     }
 
     const syncResult = await syncWhatsAppChats();
     if (!syncResult.success) errors.push(syncResult.error || 'sync failed');
 
-    const { data: savedChats, error: readError } = await admin
+    const { count: savedChatsCount, error: readError } = await admin
       .from('whatsapp_chats')
-      .select('id')
-      .eq('instance_name', instanceName)
-      .limit(5);
+      .select('id', { count: 'exact', head: true })
+      .eq('instance_name', instanceName);
 
     if (readError) errors.push(`database read: ${readError.message}`);
 
@@ -151,22 +235,28 @@ export async function GET() {
     };
 
     return NextResponse.json({
+      success: errors.length === 0,
       crmInstanceFound: Boolean(crmInstance) || instanceNameSource === 'database',
       evolutionReachable,
       evolutionStatus,
       instanceName,
       resolvedInstanceName: instanceName,
       instanceNameSource,
+      env: {
+        EVOLUTION_API_URL: Boolean(process.env.EVOLUTION_API_URL),
+        EVOLUTION_API_KEY: Boolean(process.env.EVOLUTION_API_KEY),
+        EVOLUTION_INSTANCE_NAME: Boolean(process.env.EVOLUTION_INSTANCE_NAME),
+      },
       chatsFound,
       contactsFound,
       messagesFound,
       databaseWriteOk: Boolean(syncResult.success),
       databaseReadOk: !readError,
-      savedChatsFound: savedChats?.length || 0,
+      savedChatsFound: savedChatsCount || 0,
       syncSummary: syncResult.summary || null,
       schema,
       savedData,
-      errors,
+      errors: [...envWarnings, ...errors],
     });
   } catch (error: any) {
     console.error('[whatsapp-debug-sync] failed', error);
