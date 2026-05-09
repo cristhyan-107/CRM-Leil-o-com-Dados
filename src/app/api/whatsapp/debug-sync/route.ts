@@ -106,6 +106,112 @@ async function hasUniqueConstraint(
   return !error;
 }
 
+function sanitizeSupabaseError(error: any) {
+  return {
+    code: error?.code,
+    message: error?.message,
+    details: error?.details,
+    hint: error?.hint,
+  };
+}
+
+async function runDatabaseWriteTests(
+  admin: ReturnType<typeof createAdminClient>,
+  userId: string,
+  instanceName: string
+) {
+  const remoteJid = 'debug_test@s.whatsapp.net';
+  const messageId = `debug_${Date.now()}`;
+  const now = new Date().toISOString();
+  const errors: Array<{
+    table: string;
+    operation: string;
+    supabaseError: ReturnType<typeof sanitizeSupabaseError>;
+  }> = [];
+
+  async function test(table: string, operation: string, action: () => any) {
+    const { error } = await action();
+    if (error) {
+      errors.push({ table, operation, supabaseError: sanitizeSupabaseError(error) });
+      return false;
+    }
+    return true;
+  }
+
+  const instances = await test('whatsapp_instances', 'upsert', () =>
+    admin.from('whatsapp_instances').upsert(
+      {
+        user_id: userId,
+        instance_name: instanceName,
+        status: 'open',
+        sync_status: 'completed',
+        sync_error: null,
+        updated_at: now,
+      },
+      { onConflict: 'user_id,instance_name' }
+    )
+  );
+
+  const contacts = await test('whatsapp_contacts', 'upsert', () =>
+    admin.from('whatsapp_contacts').upsert(
+      {
+        user_id: userId,
+        instance_name: instanceName,
+        remote_jid: remoteJid,
+        phone_number: 'debug_test',
+        display_name: 'debug_test',
+        raw_payload: { debug: true },
+        updated_at: now,
+      },
+      { onConflict: 'user_id,instance_name,remote_jid' }
+    )
+  );
+
+  const chats = await test('whatsapp_chats', 'upsert', () =>
+    admin.from('whatsapp_chats').upsert(
+      {
+        user_id: userId,
+        instance_name: instanceName,
+        remote_jid: remoteJid,
+        phone_number: 'debug_test',
+        chat_name: 'debug_test',
+        push_name: 'debug_test',
+        pipeline_stage: 'new',
+        raw_payload: { debug: true },
+        updated_at: now,
+      },
+      { onConflict: 'user_id,instance_name,remote_jid' }
+    )
+  );
+
+  const messages = await test('whatsapp_messages', 'upsert', () =>
+    admin.from('whatsapp_messages').upsert(
+      {
+        user_id: userId,
+        instance_name: instanceName,
+        remote_jid: remoteJid,
+        message_id: messageId,
+        message_key: messageId,
+        from_me: false,
+        message_type: 'conversation',
+        content: 'debug',
+        text: 'debug',
+        sent_at: now,
+        created_at: now,
+        updated_at: now,
+        raw_payload: { debug: true },
+      },
+      { onConflict: 'user_id,instance_name,remote_jid,message_id' }
+    )
+  );
+
+  await admin.from('whatsapp_messages').delete().eq('instance_name', instanceName).eq('remote_jid', remoteJid);
+  await admin.from('whatsapp_chats').delete().eq('instance_name', instanceName).eq('remote_jid', remoteJid);
+  await admin.from('whatsapp_contacts').delete().eq('instance_name', instanceName).eq('remote_jid', remoteJid);
+
+  return { instances, contacts, chats, messages, errors };
+}
+
 export async function GET() {
   const errors: string[] = [];
 
@@ -227,6 +333,26 @@ export async function GET() {
       ),
     };
 
+    const constraints = {
+      whatsapp_contacts: {
+        exists: schema.whatsappContactsExists,
+        uniqueColumns: ['user_id', 'instance_name', 'remote_jid'],
+        constraintName: 'whatsapp_contacts_user_instance_remote_key',
+      },
+      whatsapp_chats: {
+        exists: schema.whatsappChatsUniqueConstraint,
+        uniqueColumns: ['user_id', 'instance_name', 'remote_jid'],
+        constraintName: 'whatsapp_chats_user_instance_remote_key',
+      },
+      whatsapp_messages: {
+        exists: schema.whatsappMessagesUniqueConstraint,
+        uniqueColumns: ['user_id', 'instance_name', 'remote_jid', 'message_id'],
+        constraintName: 'whatsapp_messages_user_instance_remote_message_key',
+      },
+    };
+
+    const databaseWriteTests = await runDatabaseWriteTests(admin, user.id, instanceName);
+
     const savedData = {
       instancesSaved: await countRows(admin, 'whatsapp_instances', instanceName),
       contactsSaved: await countRows(admin, 'whatsapp_contacts', instanceName),
@@ -234,8 +360,15 @@ export async function GET() {
       messagesSaved: await countRows(admin, 'whatsapp_messages', instanceName),
     };
 
+    const databaseWriteOk = Boolean(syncResult.success) && databaseWriteTests.errors.length === 0;
+    const responseErrors = [
+      ...envWarnings,
+      ...errors,
+      ...databaseWriteTests.errors.map((error) => `${error.table} ${error.operation}: ${error.supabaseError.message}`),
+    ];
+
     return NextResponse.json({
-      success: errors.length === 0,
+      success: responseErrors.length === 0,
       crmInstanceFound: Boolean(crmInstance) || instanceNameSource === 'database',
       evolutionReachable,
       evolutionStatus,
@@ -250,13 +383,26 @@ export async function GET() {
       chatsFound,
       contactsFound,
       messagesFound,
-      databaseWriteOk: Boolean(syncResult.success),
+      databaseWriteOk,
       databaseReadOk: !readError,
+      supabaseAdminConfigured: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+      writeClient: 'service_role',
       savedChatsFound: savedChatsCount || 0,
       syncSummary: syncResult.summary || null,
+      databaseError: !syncResult.success
+        ? {
+            stage: syncResult.stage,
+            failedTable: syncResult.failedTable,
+            failedOperation: syncResult.failedOperation,
+            supabaseError: syncResult.supabaseError,
+            details: syncResult.details,
+          }
+        : null,
       schema,
+      constraints,
+      databaseWriteTests,
       savedData,
-      errors: [...envWarnings, ...errors],
+      errors: responseErrors,
     });
   } catch (error: any) {
     console.error('[whatsapp-debug-sync] failed', error);

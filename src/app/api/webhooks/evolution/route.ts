@@ -158,10 +158,11 @@ export async function POST(req: Request) {
             last_message: lastText || null,
             last_message_at: lastAt,
             unread_count: chat.unreadCount || 0,
+            pipeline_stage: 'new',
             updated_at: new Date().toISOString(),
             // pipeline_stage is intentionally OMITTED here so manual moves are preserved
           },
-          { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false }
+          { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
         );
       }
 
@@ -277,7 +278,7 @@ async function processMessage(
         raw_payload: message,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false }
+      { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
     );
     if (contactError && contactError.code !== '42P01' && contactError.code !== 'PGRST205') {
       console.warn('[Webhook] Erro ao salvar contato:', contactError.message);
@@ -285,7 +286,7 @@ async function processMessage(
   }
 
   // Inserir/atualizar mensagem de forma idempotente
-  const { error: insertError } = await supabase.from('whatsapp_messages').insert({
+  const { error: insertError } = await supabase.from('whatsapp_messages').upsert({
     user_id: userId,
     lead_id: lead?.id || null,
     instance_name: instance,
@@ -306,7 +307,7 @@ async function processMessage(
     provider: 'evolution',
     event_type: event,
     contact_name: pushName,
-  });
+  }, { onConflict: 'user_id,instance_name,remote_jid,message_id', ignoreDuplicates: false });
 
   if (insertError) {
     console.error(`[WEBHOOK TEMPORÁRIO] ERRO ao salvar mensagem no Supabase:`, insertError.message);
@@ -325,10 +326,11 @@ async function processMessage(
         last_message: content || null,
         last_message_at: sentAt,
         unread_count: fromMe ? 0 : 1, // Seremos mais precisos com CHATS_UPDATE
+        pipeline_stage: 'new',
         updated_at: new Date().toISOString(),
         // pipeline_stage is intentionally OMITTED here so manual moves are preserved
       },
-      { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false }
+      { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
     );
 
     // Incrementar unread_count para mensagens recebidas

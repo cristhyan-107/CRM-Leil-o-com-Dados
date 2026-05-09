@@ -134,7 +134,7 @@ export default function WhatsAppSettingsPage() {
     if (!syncRes.success) {
       const userMessage = syncRes.userMessage || (
         syncRes.stage?.toLowerCase().includes('database')
-          ? 'Erro ao salvar conversas no banco'
+          ? 'Evolution conectada, mas houve erro ao salvar dados no Supabase.'
           : 'Erro ao consultar Evolution API'
       );
       setSyncStatus(userMessage);
