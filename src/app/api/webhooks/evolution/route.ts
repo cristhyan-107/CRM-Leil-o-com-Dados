@@ -1,406 +1,427 @@
 import { NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { extractMessageText, jidToPhone } from '@/lib/evolution';
+import {
+  extractMessageTextFromPayload,
+  extractPhoneFromJid,
+  formatBrazilianPhone,
+  getMessageMediaInfo,
+  isBroadcastJid,
+  isGroupJid,
+  normalizeEvolutionEventName,
+  normalizeWhatsAppJid,
+  resolveContactDisplayName,
+  stableMessageId,
+} from '@/lib/whatsapp-normalize';
 
-// ============================================================
-// Webhook da Evolution API → Backend CRM
-// Recebe eventos e persiste no Supabase
-// ============================================================
+export const dynamic = 'force-dynamic';
+
+type WebhookProcessResult = {
+  processed: boolean;
+  savedContact: boolean;
+  savedChat: boolean;
+  savedMessage: boolean;
+  remoteJid?: string;
+  messageId?: string;
+  fromMe?: boolean;
+  error?: string;
+};
 
 export async function POST(req: Request) {
+  const supabase = createAdminClient();
+  const receivedAt = new Date().toISOString();
+  let payload: any = null;
+  let auditId: string | null = null;
+
   try {
-    const rawBody = await req.text();
-    let payload: any;
+    payload = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
+  }
 
-    try {
-      payload = JSON.parse(rawBody);
-    } catch {
-      return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
-    }
+  const url = new URL(req.url);
+  const headerSecret =
+    req.headers.get('x-webhook-secret') ||
+    req.headers.get('webhook-secret') ||
+    req.headers.get('x-evolution-secret');
+  const querySecret = url.searchParams.get('secret');
+  const configuredSecret = process.env.EVOLUTION_WEBHOOK_SECRET;
+  const secretValid = !configuredSecret || headerSecret === configuredSecret || querySecret === configuredSecret;
 
-    // Validação de segurança (webhook secret)
-    const secret = req.headers.get('webhook-secret') || req.headers.get('apikey');
-    if (
-      process.env.EVOLUTION_WEBHOOK_SECRET &&
-      secret !== process.env.EVOLUTION_WEBHOOK_SECRET
-    ) {
-      // Log mas não bloqueia — Evolution às vezes envia sem o header configurado
-      console.warn('[Webhook] Secret mismatch, proceeding anyway');
-    }
+  const eventRaw = payload?.event || payload?.type || payload?.eventName || '';
+  const eventNormalized = normalizeEvolutionEventName(eventRaw);
+  const instanceName = payload?.instance || payload?.instanceName || payload?.data?.instance || '';
 
-    const { event, instance, data } = payload;
-    const normalizedEvent = String(event || '').toLowerCase().replace('.', '_');
-    
-    // [LOG TEMPORÁRIO 1] - Recebimento do Webhook
-    console.log(`\n=== [WEBHOOK TEMPORÁRIO] Evento Recebido ===`);
-    console.log(`Timestamp: ${new Date().toISOString()}`);
-    console.log(`Evento original: ${event}`);
-    console.log(`Evento normalizado: ${normalizedEvent}`);
-    console.log(`Instância: ${instance}`);
+  const initialMessage = extractMessages(payload)[0];
+  const initialRemoteJid = normalizeWhatsAppJid(initialMessage?.key?.remoteJid || payload?.data?.remoteJid || '');
+  const initialMessageId = initialMessage?.key?.id || payload?.data?.key?.id || null;
 
-    let msgData: any = null;
-    if (normalizedEvent === 'messages_upsert' || normalizedEvent === 'send_message') {
-       msgData = Array.isArray(data?.messages) ? data.messages[0] : (Array.isArray(payload?.messages) ? payload.messages[0] : (data?.key ? data : (payload?.key ? payload : (Array.isArray(data) ? data[0] : {}))));
-       console.log(`Message ID: ${msgData?.key?.id}`);
-       console.log(`RemoteJid: ${msgData?.key?.remoteJid}`);
-       console.log(`FromMe: ${msgData?.key?.fromMe}`);
-       console.log(`Tem texto?: ${!!(msgData?.message?.conversation || msgData?.message?.extendedTextMessage?.text)}`);
-    }
-    console.log(`===========================================\n`);
+  const auditInsert = await supabase
+    .from('whatsapp_webhook_events')
+    .insert({
+      received_at: receivedAt,
+      instance_name: instanceName,
+      event_raw: String(eventRaw || ''),
+      event_normalized: eventNormalized,
+      remote_jid: initialRemoteJid || null,
+      message_id: initialMessageId,
+      from_me: initialMessage?.key?.fromMe ?? null,
+      secret_valid: secretValid,
+      processed: false,
+      raw_payload: payload,
+    })
+    .select('id')
+    .maybeSingle();
 
-    const supabase = createAdminClient();
+  auditId = auditInsert.data?.id || null;
 
-    // Descobrir user_id a partir do instance_name (crm_{userId_sem_hifens})
-    const instanceUserId =
-      (await resolveUserIdForInstance(supabase, instance)) || parseUserIdFromInstance(instance);
-
-    // ============================================================
-    // CONNECTION_UPDATE — Atualizar status da instância
-    // ============================================================
-    if (normalizedEvent === 'connection_update') {
-      console.log(`[Webhook] CONNECTION_UPDATE for ${instance}:`, data?.state);
-      // Nenhuma ação necessária por enquanto — frontend faz polling do status
-      return NextResponse.json({ success: true });
-    }
-
-    // ============================================================
-    // MESSAGES_UPSERT / SEND_MESSAGE — Nova mensagem
-    // ============================================================
-    if (normalizedEvent === 'messages_upsert' || normalizedEvent === 'send_message') {
-      const messages = Array.isArray(data?.messages)
-        ? data.messages
-        : Array.isArray(payload?.messages)
-        ? payload.messages
-        : data?.key
-        ? [data]
-        : payload?.key
-        ? [payload]
-        : Array.isArray(data)
-        ? data
-        : [];
-
-      for (const message of messages) {
-        await processMessage(supabase, instanceUserId, instance, message, event);
-      }
-
-      return NextResponse.json({ success: true });
-    }
-
-    // ============================================================
-    // MESSAGES_UPDATE — Atualizar status (entregue, lido)
-    // ============================================================
-    if (normalizedEvent === 'messages_update') {
-      const updates = Array.isArray(data) ? data : [data];
-
-      for (const update of updates) {
-        if (!update?.key?.id) continue;
-        const statusMap: Record<number, string> = {
-          1: 'pending',
-          2: 'sent',
-          3: 'delivered',
-          4: 'read',
-        };
-        const newStatus = statusMap[update.update?.status];
-        if (newStatus) {
-          await supabase
-            .from('whatsapp_messages')
-            .update({ status: newStatus, updated_at: new Date().toISOString() })
-            .eq('message_key', update.key.id);
-        }
-      }
-
-      return NextResponse.json({ success: true });
-    }
-
-    // ============================================================
-    // MESSAGES_DELETE
-    // ============================================================
-    if (normalizedEvent === 'messages_delete') {
-      const keys = Array.isArray(data?.keys) ? data.keys : data?.key ? [data.key] : [];
-      for (const key of keys) {
-        if (key?.id) {
-          await supabase
-            .from('whatsapp_messages')
-            .update({ content: '[Mensagem apagada]', updated_at: new Date().toISOString() })
-            .eq('message_key', key.id);
-        }
-      }
-      return NextResponse.json({ success: true });
-    }
-
-    // ============================================================
-    // CHATS_UPSERT / CHATS_UPDATE — Atualizar cache de chats
-    // ============================================================
-    if (normalizedEvent === 'chats_upsert' || normalizedEvent === 'chats_update') {
-      const chats = Array.isArray(data) ? data : [data];
-
-      for (const chat of chats) {
-        if (!chat?.remoteJid || !instanceUserId) continue;
-        if (
-          chat.remoteJid.includes('@broadcast') ||
-          chat.remoteJid.includes('@g.us') ||
-          chat.remoteJid.includes('status@')
-        )
-          continue;
-
-        const lastText = extractMessageText(chat.lastMessage?.message);
-        const lastAt = chat.lastMessage?.messageTimestamp
-          ? new Date(chat.lastMessage.messageTimestamp * 1000).toISOString()
-          : new Date().toISOString();
-
-        await supabase.from('whatsapp_chats').upsert(
-          {
-            user_id: instanceUserId,
-            instance_name: instance,
-            remote_jid: chat.remoteJid,
-            push_name: chat.pushName || jidToPhone(chat.remoteJid),
-            profile_pic_url: chat.profilePicUrl || null,
-            last_message: lastText || null,
-            last_message_at: lastAt,
-            unread_count: chat.unreadCount || 0,
-            pipeline_stage: 'new',
-            updated_at: new Date().toISOString(),
-            // pipeline_stage is intentionally OMITTED here so manual moves are preserved
-          },
-          { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
-        );
-      }
-
-      return NextResponse.json({ success: true });
-    }
-
-    // ============================================================
-    // CONTACTS_UPSERT — Atualizar nomes de contatos
-    // ============================================================
-    if (normalizedEvent === 'contacts_upsert') {
-      const contacts = Array.isArray(data) ? data : [data];
-
-      for (const contact of contacts) {
-        if (!contact?.id || !instanceUserId) continue;
-        const remoteJid = contact.id.includes('@')
-          ? contact.id
-          : `${contact.id}@s.whatsapp.net`;
-
-        if (contact.pushName || contact.profilePictureUrl) {
-          await supabase
-            .from('whatsapp_chats')
-            .update({
-              push_name: contact.pushName || undefined,
-              profile_pic_url: contact.profilePictureUrl || undefined,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('instance_name', instance)
-            .eq('remote_jid', remoteJid);
-        }
-      }
-
-      return NextResponse.json({ success: true });
-    }
-
-    console.warn('[Webhook] Evento desconhecido recebido para analise:', {
-      event,
-      normalizedEvent,
-      instance,
-      hasData: Boolean(data),
+  if (!secretValid) {
+    await updateAudit(supabase, auditId, {
+      processed: false,
+      error_message: 'Invalid webhook secret',
     });
-    return NextResponse.json({ success: true });
+    return NextResponse.json({ error: 'Unauthorized webhook' }, { status: 401 });
+  }
+
+  try {
+    let result: WebhookProcessResult = {
+      processed: false,
+      savedContact: false,
+      savedChat: false,
+      savedMessage: false,
+    };
+
+    if (eventNormalized === 'messages.upsert' || eventNormalized === 'send.message') {
+      result = await processEvolutionMessageEvent(supabase, payload);
+    } else if (eventNormalized === 'messages.update') {
+      result = await processMessageUpdates(supabase, payload);
+    } else if (eventNormalized === 'messages.delete') {
+      result = await processMessageDeletes(supabase, payload);
+    } else if (eventNormalized === 'contacts.upsert' || eventNormalized === 'contacts.update') {
+      result = await processContactEvents(supabase, payload);
+    } else if (eventNormalized === 'chats.upsert' || eventNormalized === 'chats.update') {
+      result = await processChatEvents(supabase, payload);
+    }
+
+    await updateAudit(supabase, auditId, {
+      remote_jid: result.remoteJid || initialRemoteJid || null,
+      message_id: result.messageId || initialMessageId,
+      from_me: result.fromMe ?? initialMessage?.key?.fromMe ?? null,
+      processed: result.processed,
+      saved_contact: result.savedContact,
+      saved_chat: result.savedChat,
+      saved_message: result.savedMessage,
+      error_message: result.error || null,
+    });
+
+    return NextResponse.json({
+      success: true,
+      event: eventNormalized,
+      processed: result.processed,
+      savedMessage: result.savedMessage,
+    });
   } catch (error: any) {
-    console.error('[Webhook] Unhandled exception:', error);
+    console.error('[Webhook] failed', {
+      eventRaw,
+      eventNormalized,
+      instanceName,
+      message: error?.message,
+    });
     if (error?.stack) console.error(error.stack);
+    await updateAudit(supabase, auditId, {
+      processed: false,
+      error_message: error?.message || 'Unhandled webhook error',
+    });
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }
 
-// ============================================================
-// Helper: processar uma mensagem e persistir
-// ============================================================
+export async function processEvolutionMessageEvent(supabase: any, payload: any): Promise<WebhookProcessResult> {
+  const instanceName = payload?.instance || payload?.instanceName || payload?.data?.instance || '';
+  const messages = extractMessages(payload);
+  if (!instanceName || messages.length === 0) {
+    return { processed: false, savedContact: false, savedChat: false, savedMessage: false, error: 'No message payload' };
+  }
 
-async function processMessage(
+  let lastResult: WebhookProcessResult = {
+    processed: false,
+    savedContact: false,
+    savedChat: false,
+    savedMessage: false,
+  };
+
+  for (const message of messages) {
+    lastResult = await saveEvolutionMessage(supabase, instanceName, message, payload?.event || '');
+  }
+
+  return lastResult;
+}
+
+function extractMessages(payload: any) {
+  const data = payload?.data;
+  const candidates = [
+    data?.messages,
+    payload?.messages,
+    data?.key ? data : null,
+    payload?.key ? payload : null,
+    data?.message?.key ? data.message : null,
+    payload?.message?.key ? payload.message : null,
+    Array.isArray(data) ? data : null,
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    return Array.isArray(candidate) ? candidate : [candidate];
+  }
+
+  return [];
+}
+
+async function saveEvolutionMessage(
   supabase: any,
-  instanceUserId: string | null,
-  instance: string,
+  instanceName: string,
   message: any,
   event: string
-) {
-  const remoteJid: string = message.key?.remoteJid || '';
-  if (!remoteJid) return;
+): Promise<WebhookProcessResult> {
+  const remoteJid = normalizeWhatsAppJid(message?.key?.remoteJid || message?.remoteJid);
+  if (!remoteJid || isBroadcastJid(remoteJid)) {
+    return { processed: true, savedContact: false, savedChat: false, savedMessage: false, error: 'Ignored broadcast/empty jid' };
+  }
 
-  // Ignorar broadcasts e grupos
-  if (
-    remoteJid.includes('@broadcast') ||
-    remoteJid.includes('@g.us') ||
-    remoteJid === 'status@broadcast'
-  )
-    return;
-
-  const messageKey = message.key?.id;
-  if (!messageKey) return;
-
-  const fromMe: boolean = message.key?.fromMe ?? false;
-  const content = extractMessageText(message.message);
-  const pushName = message.pushName || null;
-  const phone = jidToPhone(remoteJid);
-
-  // Idempotência: evitar duplicatas
-  const { data: existing } = await supabase
-    .from('whatsapp_messages')
-    .select('id')
-    .eq('message_key', messageKey)
-    .maybeSingle();
-
-  if (existing) return;
-
-  // Tentar encontrar lead pelo número
-  const phoneEnd = phone.slice(-8);
-  const { data: leads } = await supabase
-    .from('leads')
-    .select('id, user_id')
-    .like('phone', `%${phoneEnd}%`)
-    .limit(1);
-
-  const lead = leads?.[0] || null;
-  const userId = lead?.user_id || instanceUserId;
-
-  const sentAt = message.messageTimestamp
-    ? new Date(message.messageTimestamp * 1000).toISOString()
+  const fromMe = Boolean(message?.key?.fromMe);
+  const text = extractMessageTextFromPayload(message?.message);
+  const media = getMessageMediaInfo(message?.message);
+  const messageType = message?.messageType || Object.keys(message?.message || {})[0] || 'conversation';
+  const timestamp = message?.messageTimestamp
+    ? new Date(Number(message.messageTimestamp) * 1000).toISOString()
     : new Date().toISOString();
+  const messageId =
+    message?.key?.id ||
+    stableMessageId([instanceName, remoteJid, timestamp, fromMe, messageType, text, media.mimetype]);
+  const phone = extractPhoneFromJid(message?.key?.remoteJidAlt || remoteJid);
+  const senderName = message?.pushName || message?.senderName || null;
 
-  if (userId) {
-    const { error: contactError } = await supabase.from('whatsapp_contacts').upsert(
+  const userId = await resolveUserIdForInstance(supabase, instanceName);
+  if (!userId) {
+    return { processed: false, savedContact: false, savedChat: false, savedMessage: false, remoteJid, messageId, fromMe, error: 'No user for instance' };
+  }
+
+  const displayName = resolveContactDisplayName({
+    contact: { push_name: senderName, phone_number: phone },
+    message,
+    remoteJid,
+  });
+
+  const contact = await supabase.from('whatsapp_contacts').upsert(
+    {
+      user_id: userId,
+      instance_name: instanceName,
+      remote_jid: remoteJid,
+      phone_number: phone || null,
+      display_name: displayName,
+      push_name: senderName,
+      is_group: isGroupJid(remoteJid),
+      raw_payload: message,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
+  );
+  if (contact.error) throw contact.error;
+
+  const savedMessage = await supabase.from('whatsapp_messages').upsert(
+    {
+      user_id: userId,
+      instance_name: instanceName,
+      remote_jid: remoteJid,
+      message_id: messageId,
+      message_key: messageId,
+      from_me: fromMe,
+      sender_jid: message?.key?.participant || (fromMe ? null : remoteJid),
+      sender_name: senderName,
+      push_name: senderName,
+      message_type: messageType,
+      content: text,
+      text: text || null,
+      caption: message?.message?.imageMessage?.caption || message?.message?.videoMessage?.caption || null,
+      has_media: media.hasMedia,
+      media_mimetype: media.mimetype,
+      media_filename: media.filename,
+      message_timestamp: timestamp,
+      status: fromMe ? 'sent' : 'delivered',
+      sent_at: timestamp,
+      created_at: timestamp,
+      updated_at: new Date().toISOString(),
+      raw_payload: message,
+      phone_normalized: phone || null,
+      direction: fromMe ? 'outbound' : 'inbound',
+      provider: 'evolution',
+      event_type: event,
+      contact_name: senderName,
+    },
+    { onConflict: 'user_id,instance_name,remote_jid,message_id', ignoreDuplicates: false }
+  );
+  if (savedMessage.error) throw savedMessage.error;
+
+  const lastMessageText = text || media.filename || (media.hasMedia ? messageType : '');
+  const savedChat = await supabase.from('whatsapp_chats').upsert(
+    {
+      user_id: userId,
+      instance_name: instanceName,
+      remote_jid: remoteJid,
+      phone_number: phone || null,
+      chat_name: displayName,
+      push_name: displayName,
+      last_message: lastMessageText || null,
+      last_message_text: lastMessageText || null,
+      last_message_at: timestamp,
+      unread_count: fromMe ? 0 : 1,
+      is_group: isGroupJid(remoteJid),
+      pipeline_stage: 'new',
+      raw_payload: message,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
+  );
+  if (savedChat.error) throw savedChat.error;
+
+  return {
+    processed: true,
+    savedContact: true,
+    savedChat: true,
+    savedMessage: true,
+    remoteJid,
+    messageId,
+    fromMe,
+  };
+}
+
+async function processMessageUpdates(supabase: any, payload: any): Promise<WebhookProcessResult> {
+  const updates = Array.isArray(payload?.data) ? payload.data : [payload?.data || payload];
+  for (const update of updates) {
+    const messageId = update?.key?.id;
+    if (!messageId) continue;
+    const statusMap: Record<number, string> = { 1: 'pending', 2: 'sent', 3: 'delivered', 4: 'read' };
+    const status = statusMap[update?.update?.status] || update?.status;
+    if (status) {
+      await supabase.from('whatsapp_messages').update({ status, updated_at: new Date().toISOString() }).eq('message_id', messageId);
+    }
+  }
+  return { processed: true, savedContact: false, savedChat: false, savedMessage: false };
+}
+
+async function processMessageDeletes(supabase: any, payload: any): Promise<WebhookProcessResult> {
+  const keys = payload?.data?.keys || payload?.data?.key || payload?.keys || [];
+  const list = Array.isArray(keys) ? keys : [keys];
+  for (const key of list) {
+    if (key?.id) {
+      await supabase.from('whatsapp_messages').update({ content: '[Mensagem apagada]', updated_at: new Date().toISOString() }).eq('message_id', key.id);
+    }
+  }
+  return { processed: true, savedContact: false, savedChat: false, savedMessage: false };
+}
+
+async function processContactEvents(supabase: any, payload: any): Promise<WebhookProcessResult> {
+  const instanceName = payload?.instance || payload?.instanceName || '';
+  const userId = await resolveUserIdForInstance(supabase, instanceName);
+  const contacts = Array.isArray(payload?.data) ? payload.data : [payload?.data].filter(Boolean);
+  if (!userId) return { processed: false, savedContact: false, savedChat: false, savedMessage: false, error: 'No user for instance' };
+
+  for (const contact of contacts) {
+    const remoteJid = normalizeWhatsAppJid(contact?.remoteJid || contact?.id || contact?.jid);
+    if (!remoteJid) continue;
+    const phone = extractPhoneFromJid(remoteJid);
+    const displayName = resolveContactDisplayName({ contact: { ...contact, phone_number: phone }, remoteJid });
+    await supabase.from('whatsapp_contacts').upsert(
       {
         user_id: userId,
-        instance_name: instance,
+        instance_name: instanceName,
         remote_jid: remoteJid,
-        phone_number: phone,
-        display_name: pushName || phone,
-        push_name: pushName,
-        is_group: remoteJid.endsWith('@g.us'),
-        raw_payload: message,
+        phone_number: phone || null,
+        display_name: displayName,
+        push_name: contact?.pushName || null,
+        verified_name: contact?.verifiedName || null,
+        profile_pic_url: contact?.profilePicUrl || contact?.profilePictureUrl || null,
+        is_business: Boolean(contact?.isBusiness),
+        is_group: isGroupJid(remoteJid),
+        raw_payload: contact,
         updated_at: new Date().toISOString(),
       },
       { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
     );
-    if (contactError && contactError.code !== '42P01' && contactError.code !== 'PGRST205') {
-      console.warn('[Webhook] Erro ao salvar contato:', contactError.message);
-    }
   }
 
-  // Inserir/atualizar mensagem de forma idempotente
-  const { error: insertError } = await supabase.from('whatsapp_messages').upsert({
-    user_id: userId,
-    lead_id: lead?.id || null,
-    instance_name: instance,
-    message_key: messageKey,
-    remote_jid: remoteJid,
-    from_me: fromMe,
-    push_name: pushName,
-    message_type: message.messageType || 'conversation',
-    content,
-    status: fromMe ? 'sent' : 'delivered',
-    sent_at: sentAt,
-    created_at: sentAt,
-    raw_payload: message,
-    // Legacy
-    message_id: messageKey,
-    phone_normalized: phone,
-    direction: fromMe ? 'outbound' : 'inbound',
-    provider: 'evolution',
-    event_type: event,
-    contact_name: pushName,
-  }, { onConflict: 'user_id,instance_name,remote_jid,message_id', ignoreDuplicates: false });
+  return { processed: true, savedContact: contacts.length > 0, savedChat: false, savedMessage: false };
+}
 
-  if (insertError) {
-    console.error(`[WEBHOOK TEMPORÁRIO] ERRO ao salvar mensagem no Supabase:`, insertError.message);
-  } else {
-    console.log(`[WEBHOOK TEMPORÁRIO] Mensagem ${messageKey} salva com sucesso no Supabase. O Supabase Realtime deve emitir um INSERT agora.`);
-  }
+async function processChatEvents(supabase: any, payload: any): Promise<WebhookProcessResult> {
+  const instanceName = payload?.instance || payload?.instanceName || '';
+  const userId = await resolveUserIdForInstance(supabase, instanceName);
+  const chats = Array.isArray(payload?.data) ? payload.data : [payload?.data].filter(Boolean);
+  if (!userId) return { processed: false, savedContact: false, savedChat: false, savedMessage: false, error: 'No user for instance' };
 
-  // Atualizar cache de chats
-  if (userId) {
+  for (const chat of chats) {
+    const remoteJid = normalizeWhatsAppJid(chat?.remoteJid || chat?.id || chat?.jid);
+    if (!remoteJid || isBroadcastJid(remoteJid)) continue;
+    const phone = extractPhoneFromJid(remoteJid);
+    const displayName = resolveContactDisplayName({ chat: { ...chat, phone_number: phone }, remoteJid });
+    const lastMessageText = extractMessageTextFromPayload(chat?.lastMessage?.message);
+    const lastAt = chat?.lastMessage?.messageTimestamp
+      ? new Date(Number(chat.lastMessage.messageTimestamp) * 1000).toISOString()
+      : new Date().toISOString();
+
     await supabase.from('whatsapp_chats').upsert(
       {
         user_id: userId,
-        instance_name: instance,
+        instance_name: instanceName,
         remote_jid: remoteJid,
-        push_name: pushName || phone,
-        last_message: content || null,
-        last_message_at: sentAt,
-        unread_count: fromMe ? 0 : 1, // Seremos mais precisos com CHATS_UPDATE
+        phone_number: phone || null,
+        chat_name: displayName,
+        push_name: displayName,
+        profile_pic_url: chat?.profilePicUrl || chat?.profilePictureUrl || null,
+        last_message: lastMessageText || null,
+        last_message_text: lastMessageText || null,
+        last_message_at: lastAt,
+        unread_count: Number(chat?.unreadCount || 0),
+        is_group: isGroupJid(remoteJid),
         pipeline_stage: 'new',
+        raw_payload: chat,
         updated_at: new Date().toISOString(),
-        // pipeline_stage is intentionally OMITTED here so manual moves are preserved
       },
       { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
     );
-
-    // Incrementar unread_count para mensagens recebidas
-    if (!fromMe) {
-      try {
-        const { error: rpcError } = await supabase.rpc('increment_unread_count', {
-          p_instance: instance,
-          p_jid: remoteJid,
-        });
-        if (rpcError) {
-          console.error('[Webhook] Erro ao atualizar unread_count:', rpcError.message);
-        }
-      } catch (err) {
-        console.error('[Webhook] Falha inesperada no RPC unread_count:', err);
-      }
-    }
   }
 
-  // Registrar atividade no timeline do lead
-  if (lead && !fromMe && content) {
-    await supabase.from('activities').insert({
-      user_id: lead.user_id,
-      lead_id: lead.id,
-      type: 'whatsapp',
-      description: `WhatsApp recebido: ${content.substring(0, 60)}${content.length > 60 ? '...' : ''}`,
-      metadata: { message_key: messageKey, direction: 'inbound' },
-    });
-  }
+  return { processed: true, savedContact: false, savedChat: chats.length > 0, savedMessage: false };
 }
 
-// ============================================================
-// Helper: extrair user_id do nome da instância
-// ============================================================
-
-function parseUserIdFromInstance(instance: string): string | null {
-  if (!instance || !instance.startsWith('crm_')) return null;
-  const stripped = instance.replace('crm_', '');
-  if (stripped.length === 32) {
-    return `${stripped.slice(0, 8)}-${stripped.slice(8, 12)}-${stripped.slice(12, 16)}-${stripped.slice(16, 20)}-${stripped.slice(20)}`;
-  }
-  return null;
+async function updateAudit(supabase: any, auditId: string | null, patch: Record<string, unknown>) {
+  if (!auditId) return;
+  await supabase.from('whatsapp_webhook_events').update(patch).eq('id', auditId);
 }
 
 async function resolveUserIdForInstance(supabase: any, instance: string): Promise<string | null> {
   if (!instance) return null;
 
-  const { data: instanceRow, error: instanceError } = await supabase
+  const { data: instanceRow } = await supabase
     .from('whatsapp_instances')
     .select('user_id')
     .eq('instance_name', instance)
     .order('updated_at', { ascending: false })
     .limit(1)
     .maybeSingle();
+  if (instanceRow?.user_id) return instanceRow.user_id;
 
-  if (!instanceError && instanceRow?.user_id) return instanceRow.user_id;
-  if (instanceError && instanceError.code !== '42P01') {
-    console.warn('[Webhook] lookup whatsapp_instances failed:', instanceError.message);
-  }
-
-  const { data: chatRow, error: chatError } = await supabase
+  const { data: chatRow } = await supabase
     .from('whatsapp_chats')
     .select('user_id')
     .eq('instance_name', instance)
     .order('updated_at', { ascending: false })
     .limit(1)
     .maybeSingle();
+  if (chatRow?.user_id) return chatRow.user_id;
 
-  if (!chatError && chatRow?.user_id) return chatRow.user_id;
-  if (chatError && chatError.code !== '42P01') {
-    console.warn('[Webhook] lookup whatsapp_chats failed:', chatError.message);
+  const stripped = instance.startsWith('crm_') ? instance.replace('crm_', '') : '';
+  if (stripped.length === 32) {
+    return `${stripped.slice(0, 8)}-${stripped.slice(8, 12)}-${stripped.slice(12, 16)}-${stripped.slice(16, 20)}-${stripped.slice(20)}`;
   }
 
   return null;

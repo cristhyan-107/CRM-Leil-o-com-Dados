@@ -216,16 +216,20 @@ export async function getEvolutionQRCode(instanceName: string): Promise<any> {
 
 export async function updateEvolutionWebhook(instanceName: string) {
   const appUrl = process.env.NEXT_PUBLIC_URL || 'http://localhost:3000';
+  const secret = process.env.EVOLUTION_WEBHOOK_SECRET;
+  const webhookUrl =
+    `${appUrl}/api/webhooks/evolution${secret ? `?secret=${encodeURIComponent(secret)}` : ''}`;
 
   return evolutionFetch(`/webhook/set/${instanceName}`, {
     method: 'POST',
     body: JSON.stringify({
       webhook: {
-        url: `${appUrl}/api/webhooks/evolution`,
+        url: webhookUrl,
         enabled: true,
         webhookByEvents: false,
         webhookBase64: false,
         events: [
+          'QRCODE_UPDATED',
           'MESSAGES_UPSERT',
           'MESSAGES_UPDATE',
           'MESSAGES_DELETE',
@@ -233,6 +237,7 @@ export async function updateEvolutionWebhook(instanceName: string) {
           'CHATS_UPSERT',
           'CHATS_UPDATE',
           'CONTACTS_UPSERT',
+          'CONTACTS_UPDATE',
           'CONNECTION_UPDATE',
         ],
       },

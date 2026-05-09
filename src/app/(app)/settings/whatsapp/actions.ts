@@ -19,6 +19,15 @@ import {
   type EvolutionContact,
   type EvolutionMessage,
 } from '@/lib/evolution';
+import {
+  avatarFallback,
+  extractPhoneFromJid,
+  formatBrazilianPhone,
+  isLidJid,
+  normalizeWhatsAppJid,
+  resolveContactDisplayName,
+  resolveProfilePicture,
+} from '@/lib/whatsapp-normalize';
 
 // ============================================================
 // Helpers de instância
@@ -1049,29 +1058,46 @@ export async function getInboxContacts(): Promise<any[]> {
 
     const instanceName = await getActiveInstanceName();
 
-    const { data, error } = await createAdminClient()
+    const admin = createAdminClient();
+    const { data, error } = await admin
       .from('whatsapp_chats')
       .select('*')
       .eq('instance_name', instanceName)
       .eq('is_group', false)
-      .order('last_message_at', { ascending: false })
+      .order('last_message_at', { ascending: false, nullsFirst: false })
       .limit(100);
 
     if (error || !data) return [];
+    const remoteJids = data.map((chat) => chat.remote_jid).filter(Boolean);
+    const { data: contacts } = await admin
+      .from('whatsapp_contacts')
+      .select('remote_jid, display_name, push_name, verified_name, phone_number, profile_pic_url')
+      .eq('instance_name', instanceName)
+      .in('remote_jid', remoteJids.length ? remoteJids : ['']);
+    const contactByJid = new Map((contacts || []).map((contact: any) => [contact.remote_jid, contact]));
 
-
-    // Mapear para formato esperado pelo ChatInterface
-    return data.map((chat) => ({
-      id: chat.id,
-      phone: jidToPhone(chat.remote_jid),
-      remoteJid: chat.remote_jid,
-      name: chat.push_name || jidToPhone(chat.remote_jid),
-      lastMessage: chat.last_message || '',
-      timestamp: chat.last_message_at || chat.updated_at,
-      unreadCount: chat.unread_count || 0,
-      profilePicUrl: chat.profile_pic_url || null,
-      isLead: false, // TODO: cross-reference with leads table
-    }));
+    return data.map((chat: any) => {
+      const contact = contactByJid.get(chat.remote_jid);
+      const phoneRaw = contact?.phone_number || chat.phone_number || extractPhoneFromJid(chat.remote_jid);
+      const displayName = resolveContactDisplayName({ contact, chat, remoteJid: chat.remote_jid });
+      return {
+        id: chat.id,
+        phone: phoneRaw ? formatBrazilianPhone(phoneRaw) : '',
+        phoneNumber: phoneRaw ? formatBrazilianPhone(phoneRaw) : '',
+        remoteJid: chat.remote_jid,
+        displayName,
+        name: displayName,
+        avatarFallback: avatarFallback(displayName),
+        lastMessage: chat.last_message_text || chat.last_message || '',
+        lastMessageText: chat.last_message_text || chat.last_message || '',
+        timestamp: chat.last_message_at || chat.updated_at,
+        lastMessageAt: chat.last_message_at || chat.updated_at,
+        unreadCount: chat.unread_count || 0,
+        profilePicUrl: resolveProfilePicture({ contact, chat }),
+        isLead: false,
+        isLid: isLidJid(chat.remote_jid),
+      };
+    });
   } catch (error: any) {
     console.error('[getInboxContacts]', error.message);
     return [];

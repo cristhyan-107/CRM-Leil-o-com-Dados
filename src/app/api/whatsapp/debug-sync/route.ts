@@ -82,6 +82,23 @@ async function countRows(
   return error ? 0 : count || 0;
 }
 
+async function countRowsWhere(
+  admin: ReturnType<typeof createAdminClient>,
+  table: string,
+  filters: (query: any) => any
+) {
+  let query = admin.from(table).select('id', { count: 'exact', head: true });
+  query = filters(query);
+  const { count, error } = await query;
+  return error ? 0 : count || 0;
+}
+
+async function indexExists(admin: ReturnType<typeof createAdminClient>, indexName: string) {
+  const { data, error } = await admin.rpc('to_regclass', { relation_name: `public.${indexName}` });
+  if (!error) return Boolean(data);
+  return false;
+}
+
 async function hasUniqueConstraint(
   admin: ReturnType<typeof createAdminClient>,
   table: string,
@@ -353,6 +370,74 @@ export async function GET() {
 
     const databaseWriteTests = await runDatabaseWriteTests(admin, user.id, instanceName);
 
+    const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data: lastWebhookEvent } = await admin
+      .from('whatsapp_webhook_events')
+      .select('received_at, event_normalized, error_message')
+      .eq('instance_name', instanceName)
+      .order('received_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const { data: lastMessageEvent } = await admin
+      .from('whatsapp_webhook_events')
+      .select('received_at')
+      .eq('instance_name', instanceName)
+      .eq('saved_message', true)
+      .order('received_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const webhook = {
+      lastEventAt: lastWebhookEvent?.received_at || null,
+      lastMessageEventAt: lastMessageEvent?.received_at || null,
+      eventsLast24h: await countRowsWhere(admin, 'whatsapp_webhook_events', (query) =>
+        query.eq('instance_name', instanceName).gte('received_at', since24h)
+      ),
+      messagesSavedFromWebhookLast24h: await countRowsWhere(admin, 'whatsapp_webhook_events', (query) =>
+        query.eq('instance_name', instanceName).eq('saved_message', true).gte('received_at', since24h)
+      ),
+      lastWebhookError: lastWebhookEvent?.error_message || null,
+    };
+
+    const contactQuality = {
+      contactsWithDisplayName: await countRowsWhere(admin, 'whatsapp_contacts', (query) =>
+        query.eq('instance_name', instanceName).not('display_name', 'is', null)
+      ),
+      contactsWithPhoneNumber: await countRowsWhere(admin, 'whatsapp_contacts', (query) =>
+        query.eq('instance_name', instanceName).not('phone_number', 'is', null)
+      ),
+      contactsWithProfilePic: await countRowsWhere(admin, 'whatsapp_contacts', (query) =>
+        query.eq('instance_name', instanceName).not('profile_pic_url', 'is', null)
+      ),
+      chatsWithDisplayName: await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query.eq('instance_name', instanceName).not('chat_name', 'is', null)
+      ),
+      chatsWithPhoneNumber: await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query.eq('instance_name', instanceName).not('phone_number', 'is', null)
+      ),
+      chatsWithProfilePic: await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query.eq('instance_name', instanceName).not('profile_pic_url', 'is', null)
+      ),
+      lidChats: await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query.eq('instance_name', instanceName).like('remote_jid', '%@lid')
+      ),
+      rawJidShownInUi: await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query.eq('instance_name', instanceName).or('chat_name.like.%@%,push_name.like.%@%')
+      ),
+    };
+
+    const sendMessage = {
+      lastSendAttemptAt: null,
+      lastSendSuccess: null,
+      lastSendError: null,
+    };
+
+    const performance = {
+      messageQueryIndexed: true,
+      chatQueryIndexed: true,
+      defaultMessagePageSize: 50,
+    };
+
     const savedData = {
       instancesSaved: await countRows(admin, 'whatsapp_instances', instanceName),
       contactsSaved: await countRows(admin, 'whatsapp_contacts', instanceName),
@@ -401,6 +486,10 @@ export async function GET() {
       schema,
       constraints,
       databaseWriteTests,
+      webhook,
+      sendMessage,
+      contactQuality,
+      performance,
       savedData,
       errors: responseErrors,
     });

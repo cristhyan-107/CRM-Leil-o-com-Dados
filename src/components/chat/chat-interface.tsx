@@ -19,9 +19,7 @@ import {
 import { cn } from '@/lib/utils';
 import {
   getInboxContacts,
-  getChatHistory,
   markChatAsRead,
-  sendChatMessage,
   startNewConversation,
 } from '@/app/(app)/settings/whatsapp/actions';
 import { createClient } from '@/lib/supabase/client';
@@ -66,6 +64,9 @@ interface Contact {
   timestamp: string;
   unreadCount: number;
   profilePicUrl: string | null;
+  displayName?: string;
+  phoneNumber?: string;
+  avatarFallback?: string;
   isLead: boolean;
 }
 
@@ -104,6 +105,7 @@ export function ChatInterface({
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [isOnline, setIsOnline] = useState(true);
+  const [historyError, setHistoryError] = useState('');
 
   // Modal nova conversa
   const [showNewConv, setShowNewConv] = useState(false);
@@ -245,14 +247,33 @@ export function ChatInterface({
 
     let isMounted = true;
     setIsLoadingHistory(true);
+    setHistoryError('');
     setMessages([]);
 
-    getChatHistory(selectedContact.remoteJid).then((history) => {
-      if (isMounted) {
-        setMessages((history as Message[]) || []);
-        setIsLoadingHistory(false);
-      }
-    });
+    if (selectedContact.id.startsWith('synthetic_') || selectedContact.id.startsWith('new_')) {
+      setIsLoadingHistory(false);
+      return () => {
+        isMounted = false;
+      };
+    }
+
+    fetch(`/api/whatsapp/chats/${selectedContact.id}/messages?limit=50`)
+      .then((res) => res.json())
+      .then((result) => {
+        if (!isMounted) return;
+        if (!result.success) {
+          setHistoryError(result.error || 'Erro ao carregar mensagens');
+          setMessages([]);
+        } else {
+          setMessages((result.messages as Message[]) || []);
+        }
+      })
+      .catch((err) => {
+        if (isMounted) setHistoryError(err instanceof Error ? err.message : 'Erro ao carregar mensagens');
+      })
+      .finally(() => {
+        if (isMounted) setIsLoadingHistory(false);
+      });
 
     if (selectedContact.unreadCount > 0) {
       markChatAsRead(selectedContact.remoteJid).then(() => {
@@ -321,13 +342,22 @@ export function ChatInterface({
     }
 
     try {
-      const result = await sendChatMessage(selectedContact.remoteJid, contentToSend);
+      const response = await fetch('/api/whatsapp/send-message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chatId: selectedContact.id,
+          remoteJid: selectedContact.remoteJid,
+          text: contentToSend,
+        }),
+      });
+      const result = await response.json();
 
       if (!result.success) {
         const errMsg = normalizeError(result.error);
         console.error('[Chat] sendChatMessage failed:', { raw: result.error, normalized: errMsg });
         if ((result as any).details) {
-          console.debug('[Chat] sendChatMessage details:', (result as any).details);
+          console.debug('[Chat] send-message details:', (result as any).details);
         }
         setMessages((prev) =>
           prev.map((m) =>
@@ -337,7 +367,16 @@ export function ChatInterface({
 
       } else {
         setMessages((prev) =>
-          prev.map((m) => (m.id === tempId ? { ...m, status: 'sent' } : m))
+          prev.map((m) => (
+            m.id === tempId
+              ? {
+                  ...m,
+                  id: result.message?.id || tempId,
+                  message_id: result.message?.message_id || result.message?.message_key || tempId,
+                  status: 'sent',
+                }
+              : m
+          ))
         );
       }
     } catch (err: unknown) {
@@ -544,7 +583,7 @@ export function ChatInterface({
                         />
                       ) : (
                         <div className="w-11 h-11 rounded-full bg-gradient-to-br from-blue-900/40 to-gray-800 flex items-center justify-center border border-white/[0.08] text-sm font-semibold text-blue-300">
-                          {getInitials(contact.name)}
+                          {contact.avatarFallback || getInitials(contact.name)}
                         </div>
                       )}
                       {contact.unreadCount > 0 && (
@@ -615,7 +654,7 @@ export function ChatInterface({
                   <ArrowLeft className="w-5 h-5" />
                 </button>
                 <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-900/40 to-gray-800 flex items-center justify-center border border-white/[0.08] text-xs font-semibold text-blue-300">
-                  {getInitials(selectedContact.name)}
+                  {selectedContact.avatarFallback || getInitials(selectedContact.name)}
                 </div>
                 <div>
                   <h3 className="font-semibold text-white text-sm">
@@ -638,6 +677,16 @@ export function ChatInterface({
               {isLoadingHistory ? (
                 <div className="flex items-center justify-center h-full">
                   <RefreshCw className="w-5 h-5 text-blue-500 animate-spin" />
+                </div>
+              ) : historyError ? (
+                <div className="flex flex-col items-center justify-center h-full gap-3">
+                  <p className="text-sm text-red-400">{historyError}</p>
+                  <button
+                    onClick={() => setSelectedContact({ ...selectedContact })}
+                    className="px-3 py-1.5 rounded-lg bg-white/[0.06] text-xs text-gray-200 hover:bg-white/[0.1]"
+                  >
+                    Tentar novamente
+                  </button>
                 </div>
               ) : messages.length === 0 ? (
                 <div className="flex items-center justify-center h-full">
