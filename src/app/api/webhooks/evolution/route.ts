@@ -265,7 +265,7 @@ async function processMessage(
     : new Date().toISOString();
 
   if (userId) {
-    await supabase.from('whatsapp_contacts').upsert(
+    const { error: contactError } = await supabase.from('whatsapp_contacts').upsert(
       {
         user_id: userId,
         instance_name: instance,
@@ -279,10 +279,13 @@ async function processMessage(
       },
       { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false }
     );
+    if (contactError && contactError.code !== '42P01' && contactError.code !== 'PGRST205') {
+      console.warn('[Webhook] Erro ao salvar contato:', contactError.message);
+    }
   }
 
   // Inserir/atualizar mensagem de forma idempotente
-  const { error: insertError } = await supabase.from('whatsapp_messages').upsert({
+  const { error: insertError } = await supabase.from('whatsapp_messages').insert({
     user_id: userId,
     lead_id: lead?.id || null,
     instance_name: instance,
@@ -296,12 +299,6 @@ async function processMessage(
     sent_at: sentAt,
     created_at: sentAt,
     raw_payload: message,
-    text: content || null,
-    caption: message.message?.imageMessage?.caption || message.message?.documentMessage?.title || null,
-    has_media: Boolean(message.message?.imageMessage || message.message?.audioMessage || message.message?.documentMessage),
-    message_timestamp: sentAt,
-    sender_jid: message.key?.participant || (fromMe ? null : remoteJid),
-    sender_name: pushName,
     // Legacy
     message_id: messageKey,
     phone_normalized: phone,
@@ -309,7 +306,7 @@ async function processMessage(
     provider: 'evolution',
     event_type: event,
     contact_name: pushName,
-  }, { onConflict: 'instance_name,remote_jid,message_id', ignoreDuplicates: false });
+  });
 
   if (insertError) {
     console.error(`[WEBHOOK TEMPORÁRIO] ERRO ao salvar mensagem no Supabase:`, insertError.message);

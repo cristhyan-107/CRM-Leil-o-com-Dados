@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { createServerSupabase } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import {
-  getActiveInstanceName,
+  resolveWhatsAppInstance,
   syncWhatsAppChats,
 } from '@/app/(app)/settings/whatsapp/actions';
 import {
@@ -27,11 +27,14 @@ export async function GET() {
     }
 
     const admin = createAdminClient();
-    const instanceName = await getActiveInstanceName();
+    const resolution = await resolveWhatsAppInstance();
+    const instanceName = resolution.resolvedInstanceName;
+    const instanceNameSource = resolution.source;
 
     console.log('[whatsapp-debug-sync] start', {
       userId: user.id,
-      instanceName,
+      resolvedInstanceName: instanceName,
+      instanceNameSource,
       statusUrl: getEvolutionUrl(`/instance/connectionState/${instanceName}`),
       chatsUrl: getEvolutionUrl(`/chat/findChats/${instanceName}`),
     });
@@ -83,16 +86,19 @@ export async function GET() {
     if (readError) errors.push(`database read: ${readError.message}`);
 
     return NextResponse.json({
-      crmInstanceFound: Boolean(crmInstance),
+      crmInstanceFound: Boolean(crmInstance) || instanceNameSource === 'database',
       evolutionReachable,
       evolutionStatus,
       instanceName,
+      resolvedInstanceName: instanceName,
+      instanceNameSource,
       chatsFound,
       contactsFound,
       messagesFound,
       databaseWriteOk: Boolean(syncResult.success),
       databaseReadOk: !readError,
       savedChatsFound: savedChats?.length || 0,
+      syncSummary: syncResult.summary || null,
       errors,
     });
   } catch (error: any) {
@@ -106,6 +112,8 @@ export async function GET() {
         evolutionReachable: false,
         evolutionStatus: 'unknown',
         instanceName: null,
+        resolvedInstanceName: null,
+        instanceNameSource: null,
         chatsFound: 0,
         contactsFound: 0,
         messagesFound: 0,

@@ -42,7 +42,14 @@ async function getInstanceName() {
  * 3. Única instância open da Evolution API
  * 4. Fallback: derivar do userId (legado — pode falhar em multi-tenant)
  */
-export async function getActiveInstanceName(remoteJid?: string): Promise<string> {
+export type InstanceResolutionSource = 'database' | 'env' | 'fallback';
+
+export type InstanceResolution = {
+  resolvedInstanceName: string;
+  source: InstanceResolutionSource;
+};
+
+export async function resolveWhatsAppInstance(remoteJid?: string): Promise<InstanceResolution> {
   const admin = createAdminClient();
   const fallback = await getInstanceName();
   const supabase = await createServerSupabase();
@@ -58,7 +65,9 @@ export async function getActiveInstanceName(remoteJid?: string): Promise<string>
       .limit(1);
     if (rows?.[0]?.instance_name) {
       console.log(`[instance] ✅ via remoteJid (${remoteJid}):`, rows[0].instance_name);
-      return rows[0].instance_name;
+      const resolution = { resolvedInstanceName: rows[0].instance_name, source: 'database' as const };
+      console.log('[instance] resolved', { ...resolution, remoteJid });
+      return resolution;
     }
   }
 
@@ -73,19 +82,45 @@ export async function getActiveInstanceName(remoteJid?: string): Promise<string>
       .maybeSingle();
 
     if (!error && crmInstance?.instance_name) {
-      console.log('[instance] via whatsapp_instances:', crmInstance.instance_name);
-      return crmInstance.instance_name;
+      const resolution = { resolvedInstanceName: crmInstance.instance_name, source: 'database' as const };
+      console.log('[instance] resolved', resolution);
+      return resolution;
     }
 
     if (error && error.code !== '42P01') {
       console.warn('[instance] whatsapp_instances lookup failed:', error.message);
     }
+
+    const { data: latestUserChat, error: chatError } = await admin
+      .from('whatsapp_chats')
+      .select('instance_name')
+      .eq('user_id', user.id)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!chatError && latestUserChat?.instance_name) {
+      const resolution = {
+        resolvedInstanceName: latestUserChat.instance_name,
+        source: 'database' as const,
+      };
+      console.log('[instance] resolved', resolution);
+      return resolution;
+    }
+
+    if (chatError && chatError.code !== '42P01') {
+      console.warn('[instance] whatsapp_chats lookup failed:', chatError.message);
+    }
   }
 
   // 3. Variavel de ambiente configurada para a instancia real da Evolution
   if (process.env.EVOLUTION_INSTANCE_NAME) {
-    console.log('[instance] via EVOLUTION_INSTANCE_NAME');
-    return process.env.EVOLUTION_INSTANCE_NAME;
+    const resolution = {
+      resolvedInstanceName: process.env.EVOLUTION_INSTANCE_NAME,
+      source: 'env' as const,
+    };
+    console.log('[instance] resolved', resolution);
+    return resolution;
   }
 
   // 4. Registro mais recente no banco
@@ -94,14 +129,20 @@ export async function getActiveInstanceName(remoteJid?: string): Promise<string>
     .select('instance_name')
     .order('updated_at', { ascending: false })
     .limit(1);
-  if (latest?.[0]?.instance_name) {
+  if (false && latest?.[0]?.instance_name) {
+    // @ts-ignore legacy branch disabled by instance resolution priority.
     console.log('[instance] ✅ via whatsapp_chats mais recente:', latest[0].instance_name);
-    return latest[0].instance_name;
+    return { resolvedInstanceName: latest?.[0]?.instance_name || fallback, source: 'database' as const };
   }
 
   // 5. Fallback: userId (legado)
   console.warn('[instance] ⚠️ fallback userId (banco vazio):', fallback);
-  return fallback;
+  return { resolvedInstanceName: fallback, source: 'fallback' as const };
+}
+
+export async function getActiveInstanceName(remoteJid?: string): Promise<string> {
+  const resolution = await resolveWhatsAppInstance(remoteJid);
+  return resolution.resolvedInstanceName;
 }
 
 
@@ -193,16 +234,12 @@ function chatToRow(userId: string, instanceName: string, chat: EvolutionChat) {
     user_id: userId,
     instance_name: instanceName,
     remote_jid: chat.remoteJid,
-    phone_number: phone,
     push_name: getChatDisplayName(chat),
-    chat_name: getChatDisplayName(chat),
     profile_pic_url: chat.profilePicUrl || null,
     last_message: lastMsgText || null,
-    last_message_text: lastMsgText || null,
     last_message_at: lastMsgAt,
     unread_count: chat.unreadCount || 0,
     is_group: chat.remoteJid.endsWith('@g.us'),
-    raw_payload: chat as any,
     updated_at: new Date().toISOString(),
   };
 }
@@ -248,15 +285,9 @@ function messageToRow(
     message_key: messageId,
     remote_jid: remoteJid,
     from_me: msg.key?.fromMe ?? false,
-    sender_jid: msg.key?.participant || (msg.key?.fromMe ? null : remoteJid),
-    sender_name: msg.pushName || null,
     push_name: msg.pushName || null,
     message_type: msg.messageType || 'conversation',
-    text: content || null,
-    caption: msg.message?.imageMessage?.caption || msg.message?.documentMessage?.title || null,
     content,
-    has_media: Boolean(msg.message?.imageMessage || msg.message?.audioMessage || msg.message?.documentMessage),
-    message_timestamp: sentAt,
     sent_at: sentAt,
     created_at: sentAt,
     status: normalizeStatus(msg.status),
@@ -285,19 +316,123 @@ async function saveSyncError(instanceName: string, errorMessage: string) {
     });
 }
 
+async function saveChatRows(admin: ReturnType<typeof createAdminClient>, rows: ReturnType<typeof chatToRow>[]) {
+  if (!rows.length) return 0;
+
+  const { error, data } = await admin
+    .from('whatsapp_chats')
+    .upsert(rows, { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false })
+    .select('id');
+
+  if (!error) return data?.length || rows.length;
+
+  const missingConflict =
+    error.message?.includes('no unique or exclusion constraint') ||
+    error.code === '42P10';
+
+  if (!missingConflict) throw error;
+
+  logSync('chat upsert fallback - unique constraint unavailable', { rows: rows.length });
+
+  let saved = 0;
+  for (const row of rows) {
+    const { data: existing, error: lookupError } = await admin
+      .from('whatsapp_chats')
+      .select('id')
+      .eq('instance_name', row.instance_name)
+      .eq('remote_jid', row.remote_jid)
+      .limit(1)
+      .maybeSingle();
+
+    if (lookupError) throw lookupError;
+
+    if (existing?.id) {
+      const { error: updateError } = await admin
+        .from('whatsapp_chats')
+        .update(row)
+        .eq('id', existing.id);
+      if (updateError) throw updateError;
+    } else {
+      const { error: insertError } = await admin
+        .from('whatsapp_chats')
+        .insert(row);
+      if (insertError) throw insertError;
+    }
+    saved += 1;
+  }
+
+  return saved;
+}
+
+async function saveMessageRows(admin: ReturnType<typeof createAdminClient>, rows: ReturnType<typeof messageToRow>[]) {
+  if (!rows.length) return 0;
+
+  const { error, data } = await admin
+    .from('whatsapp_messages')
+    .upsert(rows, { onConflict: 'message_id', ignoreDuplicates: false })
+    .select('id');
+
+  if (!error) return data?.length || rows.length;
+
+  const missingConflict =
+    error.message?.includes('no unique or exclusion constraint') ||
+    error.code === '42P10';
+
+  if (!missingConflict) throw error;
+
+  logSync('message upsert fallback - unique constraint unavailable', { rows: rows.length });
+
+  let saved = 0;
+  for (const row of rows) {
+    const { data: existing, error: lookupError } = await admin
+      .from('whatsapp_messages')
+      .select('id')
+      .eq('message_id', row.message_id)
+      .limit(1)
+      .maybeSingle();
+
+    if (lookupError) throw lookupError;
+
+    if (existing?.id) {
+      const { error: updateError } = await admin
+        .from('whatsapp_messages')
+        .update(row)
+        .eq('id', existing.id);
+      if (updateError) throw updateError;
+    } else {
+      const { error: insertError } = await admin
+        .from('whatsapp_messages')
+        .insert(row);
+      if (insertError) throw insertError;
+    }
+    saved += 1;
+  }
+
+  return saved;
+}
+
 export async function syncWhatsAppChats(): Promise<{
   success: boolean;
   count?: number;
   status?: 'completed' | 'partial' | 'error';
   summary?: {
+    resolvedInstanceName: string;
+    instanceNameSource: InstanceResolutionSource;
+    chatsFound: number;
     chatsImported: number;
     contactsImported: number;
     messagesImported: number;
+    savedChatsFound: number;
     duplicatesSkipped: number;
   };
+  stage?: string;
+  instanceName?: string;
+  statusCode?: number;
+  details?: string;
   error?: string;
 }> {
   let instanceName = '';
+  let instanceNameSource: InstanceResolutionSource = 'fallback';
   try {
     const supabase = await createServerSupabase();
     const {
@@ -305,13 +440,16 @@ export async function syncWhatsAppChats(): Promise<{
     } = await supabase.auth.getUser();
     if (!user) return { success: false, error: 'Unauthorized' };
 
-    instanceName = await getActiveInstanceName();
+    const resolution = await resolveWhatsAppInstance();
+    instanceName = resolution.resolvedInstanceName;
+    instanceNameSource = resolution.source;
     const admin = createAdminClient();
     const userId = user.id;
 
     logSync('start', {
       userId,
-      instanceName,
+      resolvedInstanceName: instanceName,
+      source: instanceNameSource,
       chatsUrl: getEvolutionUrl(`/chat/findChats/${instanceName}`),
       contactsUrl: getEvolutionUrl(`/chat/findContacts/${instanceName}`),
       messagesUrl: getEvolutionUrl(`/chat/findMessages/${instanceName}`),
@@ -331,15 +469,7 @@ export async function syncWhatsAppChats(): Promise<{
     logSync('contacts fetched', { count: contacts.length });
 
     const chatRows = chats.map((chat) => chatToRow(userId, instanceName, chat));
-    let chatsImported = 0;
-    if (chatRows.length) {
-      const { error, data } = await admin
-        .from('whatsapp_chats')
-        .upsert(chatRows, { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false })
-        .select('id');
-      if (error) throw error;
-      chatsImported = data?.length || chatRows.length;
-    }
+    const chatsImported = await saveChatRows(admin, chatRows);
     logSync('chats saved', { count: chatsImported });
 
     const contactRows = contacts.map((contact) => contactToRow(userId, instanceName, contact));
@@ -349,8 +479,15 @@ export async function syncWhatsAppChats(): Promise<{
         .from('whatsapp_contacts')
         .upsert(contactRows, { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false })
         .select('id');
-      if (error) throw error;
-      contactsImported = data?.length || contactRows.length;
+      if (error) {
+        if (error.code === '42P01' || error.code === 'PGRST205') {
+          logSync('contacts skipped - whatsapp_contacts unavailable', { message: error.message });
+        } else {
+          throw error;
+        }
+      } else {
+        contactsImported = data?.length || contactRows.length;
+      }
     }
     logSync('contacts saved', { count: contactsImported });
 
@@ -373,12 +510,7 @@ export async function syncWhatsAppChats(): Promise<{
 
     let messagesImported = 0;
     if (messageRows.length) {
-      const { error, data } = await admin
-        .from('whatsapp_messages')
-        .upsert(messageRows, { onConflict: 'instance_name,remote_jid,message_id', ignoreDuplicates: false })
-        .select('id');
-      if (error) throw error;
-      messagesImported = data?.length || messageRows.length;
+      messagesImported = await saveMessageRows(admin, messageRows);
     }
     logSync('messages saved', { count: messagesImported });
 
@@ -387,7 +519,6 @@ export async function syncWhatsAppChats(): Promise<{
         .from('whatsapp_chats')
         .update({
           last_message: row.content || row.caption || null,
-          last_message_text: row.content || row.caption || null,
           last_message_at: row.sent_at,
           updated_at: new Date().toISOString(),
         })
@@ -412,10 +543,21 @@ export async function syncWhatsAppChats(): Promise<{
       }
     });
 
+    const { data: savedChats, error: savedChatsError } = await admin
+      .from('whatsapp_chats')
+      .select('id')
+      .eq('instance_name', instanceName)
+      .limit(1000);
+    if (savedChatsError) throw savedChatsError;
+
     const summary = {
+      resolvedInstanceName: instanceName,
+      instanceNameSource,
+      chatsFound: chats.length,
       chatsImported,
       contactsImported,
       messagesImported,
+      savedChatsFound: savedChats?.length || 0,
       duplicatesSkipped: Math.max(0, messageRows.length - messagesImported),
     };
 
@@ -428,7 +570,11 @@ export async function syncWhatsAppChats(): Promise<{
     return {
       success: false,
       status: 'error',
+      stage: 'sync',
+      instanceName,
+      statusCode: typeof error?.status === 'number' ? error.status : undefined,
       error: 'Erro na sincronização. Verifique os detalhes nos logs do servidor.',
+      details: message,
     };
   }
 }
@@ -650,7 +796,7 @@ export async function sendChatMessage(
       console.log('[sendChatMessage] ✅ instance_name do banco:', instanceName);
     } else {
       // Fallback: remoteJid ainda não tem chat no banco (nova conversa)
-      instanceName = await getInstanceName();
+      instanceName = (await resolveWhatsAppInstance()).resolvedInstanceName;
       console.log('[sendChatMessage] ⚠️  instance_name fallback (userId — remoteJid não encontrado no banco):', instanceName);
     }
 

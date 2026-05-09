@@ -89,9 +89,11 @@ interface Message {
 export function ChatInterface({
   instanceName,
   initialJid,
+  refreshKey,
 }: {
   instanceName?: string;
   initialJid?: string;
+  refreshKey?: number;
 }) {
   const [inbox, setInbox] = useState<Contact[]>([]);
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
@@ -131,7 +133,7 @@ export function ChatInterface({
 
   useEffect(() => {
     loadInbox();
-  }, [loadInbox]);
+  }, [loadInbox, refreshKey]);
 
   // ============================================================
   // Auto-selecionar conversa via initialJid (vindo do Pipeline)

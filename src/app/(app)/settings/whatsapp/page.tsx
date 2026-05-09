@@ -36,6 +36,7 @@ export default function WhatsAppSettingsPage() {
   const [error, setError] = useState('');
   const [syncStatus, setSyncStatus] = useState('');
   const [syncError, setSyncError] = useState('');
+  const [syncRefreshKey, setSyncRefreshKey] = useState(0);
   const [instanceName, setInstanceName] = useState('');
   const [pollingTimeout, setPollingTimeout] = useState<NodeJS.Timeout | null>(null);
 
@@ -109,17 +110,24 @@ export default function WhatsAppSettingsPage() {
 
     if (syncRes.success) {
       const chats = syncRes.summary?.chatsImported ?? syncRes.count ?? 0;
+      const savedChats = syncRes.summary?.savedChatsFound ?? chats;
       const messages = syncRes.summary?.messagesImported ?? 0;
       setSyncStatus(
-        chats === 0
+        savedChats === 0
           ? 'Sincronização concluída: nenhuma conversa encontrada'
           : `Sincronização concluída: ${chats} conversas, ${messages} mensagens`
       );
+      setSyncRefreshKey((value) => value + 1);
     } else {
       setSyncStatus('Erro na sincronização');
     }
 
     if (!syncRes.success) {
+      setSyncStatus(
+        syncRes.stage?.toLowerCase().includes('database')
+          ? 'Erro ao salvar conversas no banco'
+          : 'Erro ao consultar Evolution API'
+      );
       setSyncError(
         'Não foi possível buscar as conversas da Evolution API. Verifique se a instância está conectada e se o servidor está respondendo.'
       );
@@ -252,7 +260,7 @@ export default function WhatsAppSettingsPage() {
           </div>
 
           <div className="flex-1 overflow-hidden">
-            <ChatInterface instanceName={instanceName} />
+            <ChatInterface instanceName={instanceName} refreshKey={syncRefreshKey} />
           </div>
         </div>
       ) : (
