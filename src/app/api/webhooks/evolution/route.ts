@@ -29,30 +29,35 @@ export async function POST(req: Request) {
     }
 
     const { event, instance, data } = payload;
+    const normalizedEvent = String(event || '').toLowerCase().replace('.', '_');
     
     // [LOG TEMPORÁRIO 1] - Recebimento do Webhook
     console.log(`\n=== [WEBHOOK TEMPORÁRIO] Evento Recebido ===`);
     console.log(`Timestamp: ${new Date().toISOString()}`);
-    console.log(`Evento: ${event}`);
+    console.log(`Evento original: ${event}`);
+    console.log(`Evento normalizado: ${normalizedEvent}`);
     console.log(`Instância: ${instance}`);
-    // Log do ID da mensagem ou um pedaço pequeno se não tiver ID, sem expor tudo
-    if (event === 'MESSAGES_UPSERT' || event === 'SEND_MESSAGE') {
-       const msgData = Array.isArray(data?.messages) ? data.messages[0] : (data?.key ? data : (Array.isArray(data) ? data[0] : {}));
+
+    let msgData: any = null;
+    if (normalizedEvent === 'messages_upsert' || normalizedEvent === 'send_message') {
+       msgData = Array.isArray(data?.messages) ? data.messages[0] : (Array.isArray(payload?.messages) ? payload.messages[0] : (data?.key ? data : (payload?.key ? payload : (Array.isArray(data) ? data[0] : {}))));
        console.log(`Message ID: ${msgData?.key?.id}`);
        console.log(`RemoteJid: ${msgData?.key?.remoteJid}`);
        console.log(`FromMe: ${msgData?.key?.fromMe}`);
+       console.log(`Tem texto?: ${!!(msgData?.message?.conversation || msgData?.message?.extendedTextMessage?.text)}`);
     }
     console.log(`===========================================\n`);
 
     const supabase = createAdminClient();
 
     // Descobrir user_id a partir do instance_name (crm_{userId_sem_hifens})
-    const instanceUserId = parseUserIdFromInstance(instance);
+    const instanceUserId =
+      (await resolveUserIdForInstance(supabase, instance)) || parseUserIdFromInstance(instance);
 
     // ============================================================
     // CONNECTION_UPDATE — Atualizar status da instância
     // ============================================================
-    if (event === 'CONNECTION_UPDATE') {
+    if (normalizedEvent === 'connection_update') {
       console.log(`[Webhook] CONNECTION_UPDATE for ${instance}:`, data?.state);
       // Nenhuma ação necessária por enquanto — frontend faz polling do status
       return NextResponse.json({ success: true });
@@ -61,11 +66,15 @@ export async function POST(req: Request) {
     // ============================================================
     // MESSAGES_UPSERT / SEND_MESSAGE — Nova mensagem
     // ============================================================
-    if (event === 'MESSAGES_UPSERT' || event === 'SEND_MESSAGE') {
+    if (normalizedEvent === 'messages_upsert' || normalizedEvent === 'send_message') {
       const messages = Array.isArray(data?.messages)
         ? data.messages
+        : Array.isArray(payload?.messages)
+        ? payload.messages
         : data?.key
         ? [data]
+        : payload?.key
+        ? [payload]
         : Array.isArray(data)
         ? data
         : [];
@@ -80,7 +89,7 @@ export async function POST(req: Request) {
     // ============================================================
     // MESSAGES_UPDATE — Atualizar status (entregue, lido)
     // ============================================================
-    if (event === 'MESSAGES_UPDATE') {
+    if (normalizedEvent === 'messages_update') {
       const updates = Array.isArray(data) ? data : [data];
 
       for (const update of updates) {
@@ -106,7 +115,7 @@ export async function POST(req: Request) {
     // ============================================================
     // MESSAGES_DELETE
     // ============================================================
-    if (event === 'MESSAGES_DELETE') {
+    if (normalizedEvent === 'messages_delete') {
       const keys = Array.isArray(data?.keys) ? data.keys : data?.key ? [data.key] : [];
       for (const key of keys) {
         if (key?.id) {
@@ -122,7 +131,7 @@ export async function POST(req: Request) {
     // ============================================================
     // CHATS_UPSERT / CHATS_UPDATE — Atualizar cache de chats
     // ============================================================
-    if (event === 'CHATS_UPSERT' || event === 'CHATS_UPDATE') {
+    if (normalizedEvent === 'chats_upsert' || normalizedEvent === 'chats_update') {
       const chats = Array.isArray(data) ? data : [data];
 
       for (const chat of chats) {
@@ -162,7 +171,7 @@ export async function POST(req: Request) {
     // ============================================================
     // CONTACTS_UPSERT — Atualizar nomes de contatos
     // ============================================================
-    if (event === 'CONTACTS_UPSERT') {
+    if (normalizedEvent === 'contacts_upsert') {
       const contacts = Array.isArray(data) ? data : [data];
 
       for (const contact of contacts) {
@@ -187,10 +196,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ success: true });
     }
 
-    // Outros eventos: ignorar silenciosamente
+    console.warn('[Webhook] Evento desconhecido recebido para analise:', {
+      event,
+      normalizedEvent,
+      instance,
+      hasData: Boolean(data),
+    });
     return NextResponse.json({ success: true });
   } catch (error: any) {
-    console.error('[Webhook] Unhandled exception:', error.message);
+    console.error('[Webhook] Unhandled exception:', error);
+    if (error?.stack) console.error(error.stack);
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }
@@ -249,8 +264,25 @@ async function processMessage(
     ? new Date(message.messageTimestamp * 1000).toISOString()
     : new Date().toISOString();
 
-  // Inserir mensagem
-  const { error: insertError } = await supabase.from('whatsapp_messages').insert({
+  if (userId) {
+    await supabase.from('whatsapp_contacts').upsert(
+      {
+        user_id: userId,
+        instance_name: instance,
+        remote_jid: remoteJid,
+        phone_number: phone,
+        display_name: pushName || phone,
+        push_name: pushName,
+        is_group: remoteJid.endsWith('@g.us'),
+        raw_payload: message,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false }
+    );
+  }
+
+  // Inserir/atualizar mensagem de forma idempotente
+  const { error: insertError } = await supabase.from('whatsapp_messages').upsert({
     user_id: userId,
     lead_id: lead?.id || null,
     instance_name: instance,
@@ -264,6 +296,12 @@ async function processMessage(
     sent_at: sentAt,
     created_at: sentAt,
     raw_payload: message,
+    text: content || null,
+    caption: message.message?.imageMessage?.caption || message.message?.documentMessage?.title || null,
+    has_media: Boolean(message.message?.imageMessage || message.message?.audioMessage || message.message?.documentMessage),
+    message_timestamp: sentAt,
+    sender_jid: message.key?.participant || (fromMe ? null : remoteJid),
+    sender_name: pushName,
     // Legacy
     message_id: messageKey,
     phone_normalized: phone,
@@ -271,7 +309,7 @@ async function processMessage(
     provider: 'evolution',
     event_type: event,
     contact_name: pushName,
-  });
+  }, { onConflict: 'instance_name,remote_jid,message_id', ignoreDuplicates: false });
 
   if (insertError) {
     console.error(`[WEBHOOK TEMPORÁRIO] ERRO ao salvar mensagem no Supabase:`, insertError.message);
@@ -298,12 +336,17 @@ async function processMessage(
 
     // Incrementar unread_count para mensagens recebidas
     if (!fromMe) {
-      await supabase.rpc('increment_unread_count', {
-        p_instance: instance,
-        p_jid: remoteJid,
-      }).catch(() => {
-        // fallback: ignore se RPC não existir
-      });
+      try {
+        const { error: rpcError } = await supabase.rpc('increment_unread_count', {
+          p_instance: instance,
+          p_jid: remoteJid,
+        });
+        if (rpcError) {
+          console.error('[Webhook] Erro ao atualizar unread_count:', rpcError.message);
+        }
+      } catch (err) {
+        console.error('[Webhook] Falha inesperada no RPC unread_count:', err);
+      }
     }
   }
 
@@ -329,5 +372,37 @@ function parseUserIdFromInstance(instance: string): string | null {
   if (stripped.length === 32) {
     return `${stripped.slice(0, 8)}-${stripped.slice(8, 12)}-${stripped.slice(12, 16)}-${stripped.slice(16, 20)}-${stripped.slice(20)}`;
   }
+  return null;
+}
+
+async function resolveUserIdForInstance(supabase: any, instance: string): Promise<string | null> {
+  if (!instance) return null;
+
+  const { data: instanceRow, error: instanceError } = await supabase
+    .from('whatsapp_instances')
+    .select('user_id')
+    .eq('instance_name', instance)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!instanceError && instanceRow?.user_id) return instanceRow.user_id;
+  if (instanceError && instanceError.code !== '42P01') {
+    console.warn('[Webhook] lookup whatsapp_instances failed:', instanceError.message);
+  }
+
+  const { data: chatRow, error: chatError } = await supabase
+    .from('whatsapp_chats')
+    .select('user_id')
+    .eq('instance_name', instance)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!chatError && chatRow?.user_id) return chatRow.user_id;
+  if (chatError && chatError.code !== '42P01') {
+    console.warn('[Webhook] lookup whatsapp_chats failed:', chatError.message);
+  }
+
   return null;
 }

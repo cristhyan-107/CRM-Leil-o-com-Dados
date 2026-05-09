@@ -11,6 +11,24 @@ function buildUrl(path: string) {
   return `${cleanBase}/${cleanPath}`;
 }
 
+export class EvolutionApiError extends Error {
+  status: number;
+  url: string;
+  body: string;
+
+  constructor(message: string, status: number, url: string, body: string) {
+    super(message);
+    this.name = 'EvolutionApiError';
+    this.status = status;
+    this.url = url;
+    this.body = body;
+  }
+}
+
+export function getEvolutionUrl(endpoint: string) {
+  return buildUrl(endpoint);
+}
+
 export async function evolutionFetch(endpoint: string, options?: RequestInit) {
   const API_KEY = process.env.EVOLUTION_API_KEY;
 
@@ -63,8 +81,8 @@ export async function evolutionFetch(endpoint: string, options?: RequestInit) {
     } catch {
       errorMessage = `HTTP ${res.status}: ${textBody.substring(0, 200)}`;
     }
-    console.error(`[evolutionFetch] ERRO: ${errorMessage}`);
-    throw new Error(errorMessage);
+    console.error(`[evolutionFetch] ERRO HTTP ${res.status}: ${errorMessage}`);
+    throw new EvolutionApiError(errorMessage, res.status, finalUrl, textBody.substring(0, 1000));
   }
 
   return textBody ? JSON.parse(textBody) : {};
@@ -245,32 +263,76 @@ export interface EvolutionChat {
   };
 }
 
-export async function getEvolutionChats(instanceName: string): Promise<EvolutionChat[]> {
-  try {
-    // 55s timeout - stays within Vercel's 60s function limit
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 55000);
+function asArrayFromPayload(payload: any, candidatePaths: string[][] = []) {
+  if (Array.isArray(payload)) return payload;
 
-    const res = await evolutionFetch(`/chat/findChats/${instanceName}`, {
-      method: 'POST',
-      body: JSON.stringify({}),
-      signal: controller.signal as any,
-    }).finally(() => clearTimeout(timeout));
-
-    const chats: EvolutionChat[] = Array.isArray(res) ? res : [];
-
-    // Filter out broadcasts and groups
-    return chats.filter(
-      (c) =>
-        c.remoteJid &&
-        !c.remoteJid.includes('@broadcast') &&
-        !c.remoteJid.includes('@g.us') &&
-        !c.remoteJid.includes('status@')
-    );
-  } catch (err: any) {
-    console.error('[Evolution] getEvolutionChats error:', err.message);
-    return [];
+  for (const path of candidatePaths) {
+    let value = payload;
+    for (const key of path) value = value?.[key];
+    if (Array.isArray(value)) return value;
   }
+
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.records)) return payload.records;
+  return [];
+}
+
+export function normalizeChatPayload(payload: any): EvolutionChat[] {
+  const rawChats = asArrayFromPayload(payload, [
+    ['chats'],
+    ['chats', 'records'],
+    ['data', 'chats'],
+    ['data', 'records'],
+  ]);
+
+  return rawChats
+    .map((chat: any) => {
+      const remoteJid =
+        chat?.remoteJid ||
+        chat?.id ||
+        chat?.jid ||
+        chat?.key?.remoteJid ||
+        chat?.conversation?.id ||
+        '';
+
+      return {
+        ...chat,
+        remoteJid,
+        pushName:
+          chat?.pushName ||
+          chat?.name ||
+          chat?.subject ||
+          chat?.contact?.pushName ||
+          chat?.contact?.name,
+        profilePicUrl:
+          chat?.profilePicUrl ||
+          chat?.profilePictureUrl ||
+          chat?.picture ||
+          chat?.contact?.profilePicUrl,
+        unreadCount: Number(chat?.unreadCount || chat?.unreadMessages || 0),
+        updatedAt: chat?.updatedAt || chat?.lastMessageAt,
+      } as EvolutionChat;
+    })
+    .filter((chat: EvolutionChat) => Boolean(chat.remoteJid));
+}
+
+export async function getEvolutionChats(instanceName: string): Promise<EvolutionChat[]> {
+  // 55s timeout - stays within Vercel's 60s function limit
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 55000);
+
+  const res = await evolutionFetch(`/chat/findChats/${instanceName}`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    signal: controller.signal as any,
+  }).finally(() => clearTimeout(timeout));
+
+  return normalizeChatPayload(res).filter(
+    (c) =>
+      c.remoteJid &&
+      !c.remoteJid.includes('@broadcast') &&
+      !c.remoteJid.includes('status@')
+  );
 }
 
 export interface EvolutionMessage {
@@ -293,33 +355,96 @@ export interface EvolutionMessage {
   status?: string;
 }
 
+export interface EvolutionContact {
+  remoteJid: string;
+  phoneNumber?: string;
+  displayName?: string;
+  pushName?: string;
+  verifiedName?: string;
+  profilePicUrl?: string;
+  isBusiness?: boolean;
+  isGroup?: boolean;
+  raw?: any;
+}
+
+export function normalizeContactPayload(payload: any): EvolutionContact[] {
+  const rawContacts = asArrayFromPayload(payload, [
+    ['contacts'],
+    ['contacts', 'records'],
+    ['data', 'contacts'],
+    ['data', 'records'],
+  ]);
+
+  return rawContacts
+    .map((contact: any) => {
+      const remoteJid =
+        contact?.remoteJid ||
+        contact?.id ||
+        contact?.jid ||
+        contact?.phone ||
+        contact?.number ||
+        '';
+      const normalizedJid = remoteJid && String(remoteJid).includes('@')
+        ? String(remoteJid)
+        : remoteJid
+        ? `${String(remoteJid).replace(/\D/g, '')}@s.whatsapp.net`
+        : '';
+
+      return {
+        remoteJid: normalizedJid,
+        phoneNumber: normalizedJid ? jidToPhone(normalizedJid) : undefined,
+        displayName: contact?.name || contact?.displayName,
+        pushName: contact?.pushName,
+        verifiedName: contact?.verifiedName,
+        profilePicUrl: contact?.profilePicUrl || contact?.profilePictureUrl,
+        isBusiness: Boolean(contact?.isBusiness),
+        isGroup: normalizedJid.endsWith('@g.us'),
+        raw: contact,
+      };
+    })
+    .filter((contact: EvolutionContact) => Boolean(contact.remoteJid));
+}
+
+export async function getEvolutionContacts(instanceName: string): Promise<EvolutionContact[]> {
+  try {
+    const res = await evolutionFetch(`/chat/findContacts/${instanceName}`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    return normalizeContactPayload(res);
+  } catch (err: any) {
+    if (err instanceof EvolutionApiError && err.status === 404) {
+      console.warn('[Evolution] findContacts endpoint unavailable for this instance/version');
+      return [];
+    }
+    throw err;
+  }
+}
+
+export function normalizeMessagePayload(payload: any): EvolutionMessage[] {
+  return asArrayFromPayload(payload, [
+    ['messages'],
+    ['messages', 'records'],
+    ['data', 'messages'],
+    ['data', 'records'],
+  ]).filter((message: any) => Boolean(message?.key?.id || message?.id));
+}
+
 export async function getEvolutionMessages(
   instanceName: string,
-  remoteJid: string,
+  remoteJid?: string,
   limit = 50
 ): Promise<EvolutionMessage[]> {
-  try {
-    const res = await evolutionFetch(`/chat/findMessages/${instanceName}`, {
-      method: 'POST',
-      body: JSON.stringify({
-        where: { key: { remoteJid } },
-        limit,
-      }),
-    });
+  const where = remoteJid ? { key: { remoteJid } } : undefined;
+  const res = await evolutionFetch(`/chat/findMessages/${instanceName}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      ...(where ? { where } : {}),
+      limit,
+    }),
+  });
 
-    // Response shape: { messages: { records: [...] } } or array
-    const records =
-      Array.isArray(res?.messages?.records)
-        ? res.messages.records
-        : Array.isArray(res)
-        ? res
-        : [];
-
-    return records;
-  } catch (err: any) {
-    console.error('[Evolution] getEvolutionMessages error:', err.message);
-    return [];
-  }
+  return normalizeMessagePayload(res);
 }
 
 // ============================================================

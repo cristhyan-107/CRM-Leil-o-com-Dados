@@ -8,11 +8,14 @@ import {
   logoutEvolutionInstance,
   updateEvolutionWebhook,
   getEvolutionChats,
+  getEvolutionContacts,
   getEvolutionMessages,
   sendEvolutionMessage,
   extractMessageText,
+  getEvolutionUrl,
   jidToPhone,
   type EvolutionChat,
+  type EvolutionContact,
   type EvolutionMessage,
 } from '@/lib/evolution';
 
@@ -39,8 +42,11 @@ async function getInstanceName() {
  * 3. Única instância open da Evolution API
  * 4. Fallback: derivar do userId (legado — pode falhar em multi-tenant)
  */
-async function getActiveInstanceName(remoteJid?: string): Promise<string> {
+export async function getActiveInstanceName(remoteJid?: string): Promise<string> {
   const admin = createAdminClient();
+  const fallback = await getInstanceName();
+  const supabase = await createServerSupabase();
+  const { data: { user } } = await supabase.auth.getUser();
 
   // 1. Por remoteJid específico
   if (remoteJid) {
@@ -56,7 +62,33 @@ async function getActiveInstanceName(remoteJid?: string): Promise<string> {
     }
   }
 
-  // 2. Registro mais recente no banco
+  // 2. Registro explicito da instancia do usuario, se a tabela existir
+  if (user) {
+    const { data: crmInstance, error } = await admin
+      .from('whatsapp_instances')
+      .select('instance_name, status, updated_at')
+      .eq('user_id', user.id)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!error && crmInstance?.instance_name) {
+      console.log('[instance] via whatsapp_instances:', crmInstance.instance_name);
+      return crmInstance.instance_name;
+    }
+
+    if (error && error.code !== '42P01') {
+      console.warn('[instance] whatsapp_instances lookup failed:', error.message);
+    }
+  }
+
+  // 3. Variavel de ambiente configurada para a instancia real da Evolution
+  if (process.env.EVOLUTION_INSTANCE_NAME) {
+    console.log('[instance] via EVOLUTION_INSTANCE_NAME');
+    return process.env.EVOLUTION_INSTANCE_NAME;
+  }
+
+  // 4. Registro mais recente no banco
   const { data: latest } = await admin
     .from('whatsapp_chats')
     .select('instance_name')
@@ -67,8 +99,7 @@ async function getActiveInstanceName(remoteJid?: string): Promise<string> {
     return latest[0].instance_name;
   }
 
-  // 3. Fallback: userId (legado)
-  const fallback = await getInstanceName();
+  // 5. Fallback: userId (legado)
   console.warn('[instance] ⚠️ fallback userId (banco vazio):', fallback);
   return fallback;
 }
@@ -80,7 +111,7 @@ async function getActiveInstanceName(remoteJid?: string): Promise<string> {
 
 export async function checkWhatsAppStatus() {
   try {
-    const instanceName = await getInstanceName();
+    const instanceName = await getActiveInstanceName();
     const status = await getEvolutionInstanceStatus(instanceName);
     const state = status?.instance?.state || status?.state || 'close';
     return { success: true, state, instanceName };
@@ -95,7 +126,7 @@ export async function checkWhatsAppStatus() {
 
 export async function connectWhatsApp() {
   try {
-    const instanceName = await getInstanceName();
+    const instanceName = await getActiveInstanceName();
     const qrData = await getEvolutionQRCode(instanceName);
 
     if (qrData.alreadyConnected) {
@@ -110,7 +141,7 @@ export async function connectWhatsApp() {
 
 export async function disconnectWhatsApp() {
   try {
-    const instanceName = await getInstanceName();
+    const instanceName = await getActiveInstanceName();
     await logoutEvolutionInstance(instanceName);
     return { success: true };
   } catch (error: any) {
@@ -124,7 +155,7 @@ export async function disconnectWhatsApp() {
 
 export async function updateWebhookUrl() {
   try {
-    const instanceName = await getInstanceName();
+    const instanceName = await getActiveInstanceName();
     await updateEvolutionWebhook(instanceName);
     return { success: true };
   } catch (error: any) {
@@ -136,11 +167,137 @@ export async function updateWebhookUrl() {
 // FASE 3 — Carga inicial: sync de chats/mensagens
 // ============================================================
 
+function logSync(step: string, data: Record<string, unknown> = {}) {
+  console.log(`[whatsapp-sync] ${step}`, data);
+}
+
+function logSyncError(step: string, error: unknown, data: Record<string, unknown> = {}) {
+  console.error(`[whatsapp-sync] ${step}`, data);
+  console.error(error);
+  if (error instanceof Error && error.stack) console.error(error.stack);
+}
+
+function getChatDisplayName(chat: EvolutionChat) {
+  const phone = jidToPhone(chat.remoteJid);
+  return chat.pushName || phone || chat.remoteJid;
+}
+
+function chatToRow(userId: string, instanceName: string, chat: EvolutionChat) {
+  const lastMsgText = extractMessageText(chat.lastMessage?.message);
+  const lastMsgAt = chat.lastMessage?.messageTimestamp
+    ? new Date(chat.lastMessage.messageTimestamp * 1000).toISOString()
+    : chat.updatedAt || new Date().toISOString();
+  const phone = jidToPhone(chat.remoteJid);
+
+  return {
+    user_id: userId,
+    instance_name: instanceName,
+    remote_jid: chat.remoteJid,
+    phone_number: phone,
+    push_name: getChatDisplayName(chat),
+    chat_name: getChatDisplayName(chat),
+    profile_pic_url: chat.profilePicUrl || null,
+    last_message: lastMsgText || null,
+    last_message_text: lastMsgText || null,
+    last_message_at: lastMsgAt,
+    unread_count: chat.unreadCount || 0,
+    is_group: chat.remoteJid.endsWith('@g.us'),
+    raw_payload: chat as any,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function contactToRow(userId: string, instanceName: string, contact: EvolutionContact) {
+  const phone = contact.phoneNumber || jidToPhone(contact.remoteJid);
+  const name = contact.displayName || contact.pushName || contact.verifiedName || phone;
+
+  return {
+    user_id: userId,
+    instance_name: instanceName,
+    remote_jid: contact.remoteJid,
+    phone_number: phone,
+    display_name: name,
+    push_name: contact.pushName || null,
+    verified_name: contact.verifiedName || null,
+    profile_pic_url: contact.profilePicUrl || null,
+    is_business: contact.isBusiness || false,
+    is_group: contact.isGroup || contact.remoteJid.endsWith('@g.us'),
+    raw_payload: contact.raw || contact,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function messageToRow(
+  userId: string,
+  instanceName: string,
+  msg: EvolutionMessage,
+  fallbackRemoteJid?: string
+) {
+  const remoteJid = msg.key?.remoteJid || fallbackRemoteJid || '';
+  const messageId =
+    msg.key?.id ||
+    `fallback_${remoteJid}_${msg.messageTimestamp || Date.now()}_${msg.key?.fromMe ? 'out' : 'in'}`;
+  const content = extractMessageText(msg.message);
+  const sentAt = msg.messageTimestamp
+    ? new Date(msg.messageTimestamp * 1000).toISOString()
+    : new Date().toISOString();
+
+  return {
+    user_id: userId,
+    instance_name: instanceName,
+    message_key: messageId,
+    remote_jid: remoteJid,
+    from_me: msg.key?.fromMe ?? false,
+    sender_jid: msg.key?.participant || (msg.key?.fromMe ? null : remoteJid),
+    sender_name: msg.pushName || null,
+    push_name: msg.pushName || null,
+    message_type: msg.messageType || 'conversation',
+    text: content || null,
+    caption: msg.message?.imageMessage?.caption || msg.message?.documentMessage?.title || null,
+    content,
+    has_media: Boolean(msg.message?.imageMessage || msg.message?.audioMessage || msg.message?.documentMessage),
+    message_timestamp: sentAt,
+    sent_at: sentAt,
+    created_at: sentAt,
+    status: normalizeStatus(msg.status),
+    raw_payload: msg as any,
+    message_id: messageId,
+    phone_normalized: jidToPhone(remoteJid),
+    direction: msg.key?.fromMe ? 'outbound' : 'inbound',
+    provider: 'evolution',
+  };
+}
+
+async function saveSyncError(instanceName: string, errorMessage: string) {
+  const admin = createAdminClient();
+  await admin
+    .from('whatsapp_instances')
+    .update({
+      sync_status: 'error',
+      sync_error: errorMessage,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('instance_name', instanceName)
+    .then(({ error }) => {
+      if (error && error.code !== '42P01') {
+        console.warn('[whatsapp-sync] failed to persist sync_error:', error.message);
+      }
+    });
+}
+
 export async function syncWhatsAppChats(): Promise<{
   success: boolean;
   count?: number;
+  status?: 'completed' | 'partial' | 'error';
+  summary?: {
+    chatsImported: number;
+    contactsImported: number;
+    messagesImported: number;
+    duplicatesSkipped: number;
+  };
   error?: string;
 }> {
+  let instanceName = '';
   try {
     const supabase = await createServerSupabase();
     const {
@@ -148,45 +305,131 @@ export async function syncWhatsAppChats(): Promise<{
     } = await supabase.auth.getUser();
     if (!user) return { success: false, error: 'Unauthorized' };
 
-    const instanceName = await getActiveInstanceName();
+    instanceName = await getActiveInstanceName();
+    const admin = createAdminClient();
+    const userId = user.id;
 
-    const chats = await getEvolutionChats(instanceName);
-    if (!chats.length) return { success: true, count: 0 };
-
-    // Upsert na tabela whatsapp_chats
-    const rows = chats.map((chat: EvolutionChat) => {
-      const lastMsgText = extractMessageText(chat.lastMessage?.message);
-      const lastMsgAt = chat.lastMessage?.messageTimestamp
-        ? new Date(chat.lastMessage.messageTimestamp * 1000).toISOString()
-        : chat.updatedAt || new Date().toISOString();
-
-      return {
-        user_id: user.id,
-        instance_name: instanceName,
-        remote_jid: chat.remoteJid,
-        push_name: chat.pushName || jidToPhone(chat.remoteJid),
-        profile_pic_url: chat.profilePicUrl || null,
-        last_message: lastMsgText || null,
-        last_message_at: lastMsgAt,
-        unread_count: chat.unreadCount || 0,
-        is_group: false,
-        updated_at: new Date().toISOString(),
-      };
+    logSync('start', {
+      userId,
+      instanceName,
+      chatsUrl: getEvolutionUrl(`/chat/findChats/${instanceName}`),
+      contactsUrl: getEvolutionUrl(`/chat/findContacts/${instanceName}`),
+      messagesUrl: getEvolutionUrl(`/chat/findMessages/${instanceName}`),
     });
 
-    const { error } = await supabase
-      .from('whatsapp_chats')
-      .upsert(rows, { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false });
+    const status = await getEvolutionInstanceStatus(instanceName);
+    const state = status?.instance?.state || status?.state || status?.status;
+    logSync('instance status', { instanceName, state });
 
-    if (error) {
-      console.error('[syncWhatsAppChats] upsert error:', error);
-      return { success: false, error: error.message };
+    const chats = await getEvolutionChats(instanceName);
+    logSync('chats fetched', { count: chats.length });
+
+    const contacts = await getEvolutionContacts(instanceName).catch((err) => {
+      logSyncError('contacts fetch failed - continuing partial sync', err, { instanceName });
+      return [] as EvolutionContact[];
+    });
+    logSync('contacts fetched', { count: contacts.length });
+
+    const chatRows = chats.map((chat) => chatToRow(userId, instanceName, chat));
+    let chatsImported = 0;
+    if (chatRows.length) {
+      const { error, data } = await admin
+        .from('whatsapp_chats')
+        .upsert(chatRows, { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false })
+        .select('id');
+      if (error) throw error;
+      chatsImported = data?.length || chatRows.length;
+    }
+    logSync('chats saved', { count: chatsImported });
+
+    const contactRows = contacts.map((contact) => contactToRow(userId, instanceName, contact));
+    let contactsImported = 0;
+    if (contactRows.length) {
+      const { error, data } = await admin
+        .from('whatsapp_contacts')
+        .upsert(contactRows, { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false })
+        .select('id');
+      if (error) throw error;
+      contactsImported = data?.length || contactRows.length;
+    }
+    logSync('contacts saved', { count: contactsImported });
+
+    const messageRows: any[] = [];
+    for (const chat of chats.slice(0, 50)) {
+      const messages = await getEvolutionMessages(instanceName, chat.remoteJid, 20).catch((err) => {
+        logSyncError('messages fetch failed for chat - continuing', err, {
+          instanceName,
+          remoteJid: chat.remoteJid,
+        });
+        return [] as EvolutionMessage[];
+      });
+      logSync('messages fetched for chat', { remoteJid: chat.remoteJid, count: messages.length });
+      messageRows.push(
+        ...messages
+          .map((msg) => messageToRow(userId, instanceName, msg, chat.remoteJid))
+          .filter((row) => row.remote_jid && row.message_key)
+      );
     }
 
-    return { success: true, count: rows.length };
+    let messagesImported = 0;
+    if (messageRows.length) {
+      const { error, data } = await admin
+        .from('whatsapp_messages')
+        .upsert(messageRows, { onConflict: 'instance_name,remote_jid,message_id', ignoreDuplicates: false })
+        .select('id');
+      if (error) throw error;
+      messagesImported = data?.length || messageRows.length;
+    }
+    logSync('messages saved', { count: messagesImported });
+
+    for (const row of messageRows) {
+      await admin
+        .from('whatsapp_chats')
+        .update({
+          last_message: row.content || row.caption || null,
+          last_message_text: row.content || row.caption || null,
+          last_message_at: row.sent_at,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('instance_name', instanceName)
+        .eq('remote_jid', row.remote_jid);
+    }
+
+    await admin.from('whatsapp_instances').upsert(
+      {
+        user_id: userId,
+        instance_name: instanceName,
+        status: String(state || 'open'),
+        last_sync_at: new Date().toISOString(),
+        sync_status: 'completed',
+        sync_error: null,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'instance_name', ignoreDuplicates: false }
+    ).then(({ error }) => {
+      if (error && error.code !== '42P01') {
+        console.warn('[whatsapp-sync] failed to update whatsapp_instances:', error.message);
+      }
+    });
+
+    const summary = {
+      chatsImported,
+      contactsImported,
+      messagesImported,
+      duplicatesSkipped: Math.max(0, messageRows.length - messagesImported),
+    };
+
+    logSync('completed', { instanceName, ...summary });
+    return { success: true, status: 'completed', count: chatsImported, summary };
   } catch (error: any) {
-    console.error('[syncWhatsAppChats]', error.message);
-    return { success: false, error: error.message };
+    const message = error?.message || 'Erro desconhecido na sincronizacao';
+    logSyncError('failed', error, { instanceName });
+    if (instanceName) await saveSyncError(instanceName, message);
+    return {
+      success: false,
+      status: 'error',
+      error: 'Erro na sincronização. Verifique os detalhes nos logs do servidor.',
+    };
   }
 }
 

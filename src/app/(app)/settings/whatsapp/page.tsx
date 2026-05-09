@@ -1,4 +1,5 @@
 'use client';
+/* eslint-disable react-hooks/immutability */
 
 import { useState, useEffect, useCallback } from 'react';
 import {
@@ -6,7 +7,6 @@ import {
   LogOut,
   RefreshCw,
   AlertCircle,
-  CheckCircle2,
   RotateCcw,
   Loader2,
 } from 'lucide-react';
@@ -35,6 +35,7 @@ export default function WhatsAppSettingsPage() {
   const [qrCode, setQrCode] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [syncStatus, setSyncStatus] = useState('');
+  const [syncError, setSyncError] = useState('');
   const [instanceName, setInstanceName] = useState('');
   const [pollingTimeout, setPollingTimeout] = useState<NodeJS.Timeout | null>(null);
 
@@ -65,18 +66,18 @@ export default function WhatsAppSettingsPage() {
     return () => stopPolling();
   }, [loadStatus]);
 
-  const stopPolling = () => {
+  function stopPolling() {
     if (pollingTimeout) {
       clearTimeout(pollingTimeout);
       setPollingTimeout(null);
     }
-  };
+  }
 
   // ============================================================
   // Polling após QR gerado (esperar scan)
   // ============================================================
 
-  const startPolling = useCallback(() => {
+  function startPolling() {
     const poll = setTimeout(async () => {
       const res = await checkWhatsAppStatus();
       if (res.success && res.state?.toUpperCase() === 'OPEN') {
@@ -88,14 +89,16 @@ export default function WhatsAppSettingsPage() {
       }
     }, 3000);
     setPollingTimeout(poll);
-  }, []);
+  }
 
   // ============================================================
   // Sincronizar chats + atualizar webhook
   // ============================================================
 
-  const runSync = async (instName?: string) => {
+  async function runSync(_instName?: string) {
+    void _instName;
     setState('SYNCING');
+    setSyncError('');
     setSyncStatus('Atualizando webhook...');
 
     // IMPORTANTE: atualizar URL do webhook para Vercel
@@ -105,14 +108,26 @@ export default function WhatsAppSettingsPage() {
     const syncRes = await syncWhatsAppChats();
 
     if (syncRes.success) {
-      setSyncStatus(`${syncRes.count || 0} conversas carregadas`);
+      const chats = syncRes.summary?.chatsImported ?? syncRes.count ?? 0;
+      const messages = syncRes.summary?.messagesImported ?? 0;
+      setSyncStatus(
+        chats === 0
+          ? 'Sincronização concluída: nenhuma conversa encontrada'
+          : `Sincronização concluída: ${chats} conversas, ${messages} mensagens`
+      );
     } else {
       setSyncStatus('Erro na sincronização');
     }
 
+    if (!syncRes.success) {
+      setSyncError(
+        'Não foi possível buscar as conversas da Evolution API. Verifique se a instância está conectada e se o servidor está respondendo.'
+      );
+    }
+
     setState('OPEN');
-    setTimeout(() => setSyncStatus(''), 3000);
-  };
+    if (syncRes.success) setTimeout(() => setSyncStatus(''), 5000);
+  }
 
   // ============================================================
   // Gerar QR Code
@@ -207,6 +222,11 @@ export default function WhatsAppSettingsPage() {
                   <span className="text-xs font-medium text-emerald-400">WhatsApp Conectado</span>
                   {syncStatus && (
                     <span className="text-xs text-gray-500 ml-1">· {syncStatus}</span>
+                  )}
+                  {syncError && (
+                    <span className="text-xs text-red-400 ml-1 cursor-help" title={syncError}>
+                      · Ver detalhes
+                    </span>
                   )}
                 </>
               )}
