@@ -4,6 +4,7 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { EvolutionApiError, getEvolutionUrl, sendEvolutionMessage } from '@/lib/evolution';
 import {
   extractPhoneFromJid,
+  isLidJid,
   normalizeWhatsAppJid,
   stableMessageId,
 } from '@/lib/whatsapp-normalize';
@@ -52,11 +53,26 @@ export async function POST(req: Request) {
     .limit(1)
     .maybeSingle();
 
-  const phone = contact?.phone_number || chat?.phone_number || extractPhoneFromJid(remoteJid);
+  const { data: altMessage } = await admin
+    .from('whatsapp_messages')
+    .select('raw_payload')
+    .eq('instance_name', instanceName)
+    .eq('remote_jid', remoteJid)
+    .order('created_at', { ascending: false })
+    .limit(20);
+
+  const altJid = (altMessage || [])
+    .map((row: any) => row?.raw_payload?.key?.remoteJidAlt)
+    .find(Boolean) || '';
+  const phone = contact?.phone_number || chat?.phone_number || extractPhoneFromJid(altJid) || extractPhoneFromJid(remoteJid);
   const diagnostics = {
+    stage: 'evolutionSend',
     endpoint: getEvolutionUrl(`/message/sendText/${instanceName}`),
     instanceName,
     remoteJid,
+    resolvedSendJid: altJid || remoteJid,
+    phoneNumber: phone || null,
+    isLid: isLidJid(remoteJid),
     phoneResolved: Boolean(phone),
   };
 
@@ -64,6 +80,16 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         success: false,
+        stage: 'normalizeRemoteJid',
+        instanceName,
+        remoteJid,
+        resolvedSendJid: altJid || remoteJid,
+        phoneNumber: null,
+        isLid: isLidJid(remoteJid),
+        evolutionEndpoint: diagnostics.endpoint,
+        evolutionStatusCode: null,
+        evolutionResponse: null,
+        databaseError: null,
         error: 'Não foi possível identificar telefone real para este contato.',
         details: diagnostics,
       },
@@ -137,6 +163,21 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         success: false,
+        stage: error instanceof EvolutionApiError ? 'evolutionSend' : 'databaseSave',
+        instanceName,
+        remoteJid,
+        resolvedSendJid: altJid || remoteJid,
+        phoneNumber: phone || null,
+        isLid: isLidJid(remoteJid),
+        evolutionEndpoint: diagnostics.endpoint,
+        evolutionStatusCode: error?.status || null,
+        evolutionResponse: error instanceof EvolutionApiError ? safeJson(error.body) : null,
+        databaseError: error instanceof EvolutionApiError ? null : {
+          code: error?.code,
+          message: error?.message,
+          details: error?.details,
+          hint: error?.hint,
+        },
         error: friendlySendError(error),
         details: {
           ...diagnostics,
@@ -146,5 +187,13 @@ export async function POST(req: Request) {
       },
       { status: error instanceof EvolutionApiError ? 502 : 500 }
     );
+  }
+}
+
+function safeJson(value: string) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
   }
 }

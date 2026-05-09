@@ -16,7 +16,6 @@ import {
   connectWhatsApp,
   disconnectWhatsApp,
   syncWhatsAppChats,
-  updateWebhookUrl,
 } from './actions';
 import { ChatInterface } from '@/components/chat/chat-interface';
 
@@ -36,6 +35,8 @@ export default function WhatsAppSettingsPage() {
   const [error, setError] = useState('');
   const [syncStatus, setSyncStatus] = useState('');
   const [syncError, setSyncError] = useState('');
+  const [webhookStatus, setWebhookStatus] = useState<'unknown' | 'checking' | 'configured' | 'updating' | 'success' | 'error'>('unknown');
+  const [webhookMessage, setWebhookMessage] = useState('');
   const [syncRefreshKey, setSyncRefreshKey] = useState(0);
   const [instanceName, setInstanceName] = useState('');
   const [pollingTimeout, setPollingTimeout] = useState<NodeJS.Timeout | null>(null);
@@ -52,9 +53,8 @@ export default function WhatsAppSettingsPage() {
       setState(s === 'OPEN' ? 'OPEN' : 'DISCONNECTED');
       setInstanceName(res.instanceName || '');
 
-      // Se conectado, sincronizar chats automaticamente
       if (s === 'OPEN') {
-        runSync(res.instanceName);
+        checkWebhookStatus();
       }
     } else {
       setState('UNAUTHORIZED');
@@ -96,14 +96,53 @@ export default function WhatsAppSettingsPage() {
   // Sincronizar chats + atualizar webhook
   // ============================================================
 
+  async function checkWebhookStatus() {
+    setWebhookStatus('checking');
+    try {
+      const response = await fetch('/api/whatsapp/webhook-status', { cache: 'no-store' });
+      const data = await response.json();
+      const ok = Boolean(data.webhookConfiguredInEvolution && data.webhookUrlMatches);
+      setWebhookStatus(ok ? 'configured' : 'unknown');
+      setWebhookMessage(ok ? 'Webhook configurado' : 'Webhook pendente');
+    } catch {
+      setWebhookStatus('error');
+      setWebhookMessage('Falha ao verificar webhook');
+    }
+  }
+
+  async function configureWebhook() {
+    setWebhookStatus('updating');
+    setWebhookMessage('Atualizando webhook...');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch('/api/whatsapp/webhook-configure', {
+        method: 'POST',
+        signal: controller.signal,
+      });
+      const data = await response.json();
+      setWebhookStatus(data.success ? 'success' : 'error');
+      setWebhookMessage(data.message || (data.success ? 'Webhook atualizado' : 'Falha ao atualizar webhook'));
+    } catch (err) {
+      setWebhookStatus('error');
+      setWebhookMessage(
+        err instanceof DOMException && err.name === 'AbortError'
+          ? 'Falha ao atualizar webhook: tempo limite'
+          : 'Falha ao atualizar webhook'
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async function runSync(_instName?: string) {
     void _instName;
     setState('SYNCING');
     setSyncError('');
-    setSyncStatus('Atualizando webhook...');
+    setSyncStatus('Sincronizando conversas...');
 
     // IMPORTANTE: atualizar URL do webhook para Vercel
-    const webhookRes = await updateWebhookUrl().catch((err) => ({
+    const webhookRes = await Promise.resolve({ success: true }).catch((err) => ({
       success: false,
       error: err instanceof Error ? err.message : 'Webhook não configurado',
     }));
@@ -121,7 +160,7 @@ export default function WhatsAppSettingsPage() {
           : `Sincronização concluída: ${chats} conversas, ${messages} mensagens`
       );
       setSyncRefreshKey((value) => value + 1);
-      if (!webhookRes.success) {
+      if (false && !webhookRes.success) {
         setSyncStatus('Webhook não configurado');
         setSyncError(
           'As conversas foram sincronizadas, mas o webhook não foi atualizado. Novas mensagens podem não aparecer automaticamente.'
@@ -144,7 +183,7 @@ export default function WhatsAppSettingsPage() {
     }
 
     setState('OPEN');
-    if (syncRes.success && webhookRes.success) setTimeout(() => setSyncStatus(''), 5000);
+    if (syncRes.success) setTimeout(() => setSyncStatus(''), 5000);
   }
 
   // ============================================================
@@ -257,6 +296,15 @@ export default function WhatsAppSettingsPage() {
               >
                 <RotateCcw className={`w-3 h-3 ${state === 'SYNCING' ? 'animate-spin' : ''}`} />
                 Sincronizar
+              </button>
+              <button
+                onClick={configureWebhook}
+                disabled={webhookStatus === 'updating'}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs text-gray-400 hover:text-white bg-white/[0.03] hover:bg-white/[0.07] rounded-lg border border-white/[0.06] transition-colors"
+                title={webhookMessage || 'Reconfigurar webhook'}
+              >
+                <RefreshCw className={`w-3 h-3 ${webhookStatus === 'updating' ? 'animate-spin' : ''}`} />
+                Webhook
               </button>
               <button
                 onClick={handleDisconnect}

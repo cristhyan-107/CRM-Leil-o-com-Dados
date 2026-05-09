@@ -79,6 +79,11 @@ interface Message {
   created_at: string;
   push_name?: string;
   remote_jid?: string;
+  message_type?: string;
+  has_media?: boolean;
+  media_mimetype?: string | null;
+  media_filename?: string | null;
+  media_url?: string | null;
   _error?: string;
 }
 
@@ -106,6 +111,7 @@ export function ChatInterface({
   const [searchQuery, setSearchQuery] = useState('');
   const [isOnline, setIsOnline] = useState(true);
   const [historyError, setHistoryError] = useState('');
+  const [isSyncingHistory, setIsSyncingHistory] = useState(false);
 
   // Modal nova conversa
   const [showNewConv, setShowNewConv] = useState(false);
@@ -193,6 +199,11 @@ export function ChatInterface({
               created_at: newMsg.sent_at || newMsg.created_at,
               push_name: newMsg.push_name,
               remote_jid: newMsg.remote_jid,
+              message_type: newMsg.message_type,
+              has_media: newMsg.has_media,
+              media_mimetype: newMsg.media_mimetype,
+              media_filename: newMsg.media_filename,
+              media_url: newMsg.media_url,
             };
 
             if (payload.eventType === 'INSERT') {
@@ -392,6 +403,23 @@ export function ChatInterface({
     }
 
   };
+
+  async function syncSelectedHistory() {
+    if (!selectedContact || selectedContact.id.startsWith('synthetic_') || selectedContact.id.startsWith('new_')) return;
+    setIsSyncingHistory(true);
+    try {
+      await fetch('/api/whatsapp/sync-history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'selectedChat', chatId: selectedContact.id, limitPerChat: 500, includeMedia: false }),
+      });
+      const res = await fetch(`/api/whatsapp/chats/${selectedContact.id}/messages?limit=50`);
+      const data = await res.json();
+      if (data.success) setMessages(data.messages || []);
+    } finally {
+      setIsSyncingHistory(false);
+    }
+  }
 
 
   // ============================================================
@@ -663,6 +691,14 @@ export function ChatInterface({
                   <p className="text-xs text-gray-500">{selectedContact.phone}</p>
                 </div>
               </div>
+              <button
+                onClick={syncSelectedHistory}
+                disabled={isSyncingHistory}
+                className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 text-xs text-gray-400 hover:text-white bg-white/[0.03] hover:bg-white/[0.07] rounded-lg border border-white/[0.06] transition-colors"
+              >
+                <RefreshCw className={`w-3 h-3 ${isSyncingHistory ? 'animate-spin' : ''}`} />
+                Buscar mais histórico
+              </button>
             </div>
 
             {/* Mensagens */}
@@ -731,7 +767,28 @@ export function ChatInterface({
                                 : 'bg-[#161c28] border border-white/[0.04] text-gray-100 rounded-2xl rounded-bl-sm'
                             )}
                           >
-                            <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+                            {msg.has_media && msg.media_mimetype?.startsWith('image/') ? (
+                              <div className="mb-2 overflow-hidden rounded-xl border border-white/10">
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={msg.media_url || `/api/whatsapp/messages/${msg.message_id}/media`}
+                                  alt={msg.media_filename || 'Imagem'}
+                                  className="max-h-72 w-full object-cover"
+                                />
+                              </div>
+                            ) : msg.has_media && msg.media_mimetype?.startsWith('audio/') ? (
+                              <audio controls src={msg.media_url || `/api/whatsapp/messages/${msg.message_id}/media`} className="mb-2 max-w-full" />
+                            ) : msg.has_media ? (
+                              <a
+                                href={msg.media_url || `/api/whatsapp/messages/${msg.message_id}/media`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="mb-2 block rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-blue-100 hover:bg-black/30"
+                              >
+                                Carregar mídia {msg.media_filename ? `- ${msg.media_filename}` : ''}
+                              </a>
+                            ) : null}
+                            {msg.content && <p className="whitespace-pre-wrap break-words">{msg.content}</p>}
                             <div
                               className={cn(
                                 'flex items-center justify-end gap-1 mt-1 -mb-0.5',

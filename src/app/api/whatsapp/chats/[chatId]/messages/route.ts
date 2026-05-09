@@ -27,7 +27,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ chatId: string 
 
   let query = admin
     .from('whatsapp_messages')
-    .select('id, message_id, message_key, content, text, caption, from_me, direction, status, sent_at, created_at, message_timestamp, push_name, sender_name, remote_jid, message_type, has_media')
+    .select('id, message_id, message_key, content, text, caption, from_me, direction, status, sent_at, created_at, message_timestamp, push_name, sender_name, remote_jid, message_type, has_media, media_mimetype, media_filename, media_url')
     .eq('instance_name', chat.instance_name)
     .eq('remote_jid', chat.remote_jid)
     .order('message_timestamp', { ascending: false, nullsFirst: false })
@@ -55,6 +55,9 @@ export async function GET(req: Request, ctx: { params: Promise<{ chatId: string 
     remote_jid: msg.remote_jid,
     message_type: msg.message_type,
     has_media: msg.has_media,
+    media_mimetype: msg.media_mimetype,
+    media_filename: msg.media_filename,
+    media_url: msg.media_url,
   }));
 
   return NextResponse.json({

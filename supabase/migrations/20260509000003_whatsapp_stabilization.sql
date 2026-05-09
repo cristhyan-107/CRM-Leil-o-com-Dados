@@ -33,5 +33,7 @@ BEGIN
   EXECUTE 'CREATE INDEX IF NOT EXISTS idx_whatsapp_contacts_user_instance_jid
     ON whatsapp_contacts(user_id, instance_name, remote_jid)';
 
+  EXECUTE 'ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS media_url TEXT';
+
   EXECUTE 'ALTER TABLE whatsapp_webhook_events ENABLE ROW LEVEL SECURITY';
 END $$;

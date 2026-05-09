@@ -190,6 +190,12 @@ async function saveEvolutionMessage(
   const fromMe = Boolean(message?.key?.fromMe);
   const text = extractMessageTextFromPayload(message?.message);
   const media = getMessageMediaInfo(message?.message);
+  const mediaNode =
+    message?.message?.imageMessage ||
+    message?.message?.videoMessage ||
+    message?.message?.audioMessage ||
+    message?.message?.documentMessage ||
+    message?.message?.stickerMessage;
   const messageType = message?.messageType || Object.keys(message?.message || {})[0] || 'conversation';
   const timestamp = message?.messageTimestamp
     ? new Date(Number(message.messageTimestamp) * 1000).toISOString()
@@ -245,6 +251,7 @@ async function saveEvolutionMessage(
       has_media: media.hasMedia,
       media_mimetype: media.mimetype,
       media_filename: media.filename,
+      media_url: mediaNode?.url || null,
       message_timestamp: timestamp,
       status: fromMe ? 'sent' : 'delivered',
       sent_at: timestamp,

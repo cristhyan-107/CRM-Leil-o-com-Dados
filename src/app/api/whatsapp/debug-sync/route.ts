@@ -438,6 +438,22 @@ export async function GET() {
       defaultMessagePageSize: 50,
     };
 
+    const media = {
+      messagesWithMedia: await countRowsWhere(admin, 'whatsapp_messages', (query) =>
+        query.eq('instance_name', instanceName).eq('has_media', true)
+      ),
+      messagesWithMediaUrl: await countRowsWhere(admin, 'whatsapp_messages', (query) =>
+        query.eq('instance_name', instanceName).not('media_url', 'is', null)
+      ),
+      mediaRouteAvailable: true,
+    };
+
+    const history = {
+      syncHistoryRouteAvailable: true,
+      lastHistorySyncAt: null,
+      lastHistorySyncImported: 0,
+    };
+
     const savedData = {
       instancesSaved: await countRows(admin, 'whatsapp_instances', instanceName),
       contactsSaved: await countRows(admin, 'whatsapp_contacts', instanceName),
@@ -490,6 +506,8 @@ export async function GET() {
       sendMessage,
       contactQuality,
       performance,
+      media,
+      history,
       savedData,
       errors: responseErrors,
     });

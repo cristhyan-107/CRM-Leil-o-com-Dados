@@ -94,7 +94,7 @@ export async function evolutionFetch(endpoint: string, options?: RequestInit) {
 // ============================================================
 
 export async function createEvolutionInstance(instanceName: string) {
-  const appUrl = process.env.NEXT_PUBLIC_URL || 'http://localhost:3000';
+  const appUrl = process.env.NEXT_PUBLIC_URL || 'https://crm-imob.leilaocomdados.com.br';
 
   const response = await evolutionFetch('/instance/create', {
     method: 'POST',
@@ -215,7 +215,7 @@ export async function getEvolutionQRCode(instanceName: string): Promise<any> {
 // ============================================================
 
 export async function updateEvolutionWebhook(instanceName: string) {
-  const appUrl = process.env.NEXT_PUBLIC_URL || 'http://localhost:3000';
+  const appUrl = process.env.NEXT_PUBLIC_URL || 'https://crm-imob.leilaocomdados.com.br';
   const secret = process.env.EVOLUTION_WEBHOOK_SECRET;
   const webhookUrl =
     `${appUrl}/api/webhooks/evolution${secret ? `?secret=${encodeURIComponent(secret)}` : ''}`;
@@ -243,6 +243,18 @@ export async function updateEvolutionWebhook(instanceName: string) {
       },
     }),
   });
+}
+
+export async function getEvolutionWebhook(instanceName: string) {
+  try {
+    return await evolutionFetch(`/webhook/find/${instanceName}`, { method: 'GET' });
+  } catch (error) {
+    try {
+      return await evolutionFetch(`/webhook/get/${instanceName}`, { method: 'GET' });
+    } catch {
+      throw error;
+    }
+  }
 }
 
 // ============================================================

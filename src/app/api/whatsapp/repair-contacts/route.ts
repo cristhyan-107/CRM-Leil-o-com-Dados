@@ -36,10 +36,22 @@ export async function POST() {
     .limit(2000);
 
   const contactByJid = new Map((contacts || []).map((contact: any) => [contact.remote_jid, contact]));
+  const { data: altRows } = await admin
+    .from('whatsapp_messages')
+    .select('remote_jid, raw_payload')
+    .eq('user_id', user.id)
+    .not('raw_payload', 'is', null)
+    .limit(5000);
+  const phoneByJid = new Map<string, string>();
+  for (const row of altRows || []) {
+    const alt = (row as any)?.raw_payload?.key?.remoteJidAlt;
+    const phone = extractPhoneFromJid(alt);
+    if (phone && !phoneByJid.has((row as any).remote_jid)) phoneByJid.set((row as any).remote_jid, phone);
+  }
 
   for (const contact of contacts || []) {
     contactsProcessed += 1;
-    const phone = contact.phone_number || extractPhoneFromJid(contact.remote_jid);
+    const phone = contact.phone_number || phoneByJid.get(contact.remote_jid) || extractPhoneFromJid(contact.remote_jid);
     if (isLidJid(contact.remote_jid) && !phone) lidSkipped += 1;
     const displayName = resolveContactDisplayName({ contact: { ...contact, phone_number: phone }, remoteJid: contact.remote_jid });
     const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -60,7 +72,7 @@ export async function POST() {
   for (const chat of chats || []) {
     chatsProcessed += 1;
     const contact = contactByJid.get(chat.remote_jid);
-    const phone = chat.phone_number || contact?.phone_number || extractPhoneFromJid(chat.remote_jid);
+    const phone = chat.phone_number || contact?.phone_number || phoneByJid.get(chat.remote_jid) || extractPhoneFromJid(chat.remote_jid);
     if (isLidJid(chat.remote_jid) && !phone) lidSkipped += 1;
     const displayName = resolveContactDisplayName({ contact, chat: { ...chat, phone_number: phone }, remoteJid: chat.remote_jid });
     const profilePic = contact?.profile_pic_url || chat.profile_pic_url || null;
