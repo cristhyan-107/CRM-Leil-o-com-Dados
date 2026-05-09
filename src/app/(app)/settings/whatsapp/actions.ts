@@ -3,6 +3,7 @@
 import { createServerSupabase } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import {
+  EvolutionApiError,
   getEvolutionInstanceStatus,
   getEvolutionQRCode,
   logoutEvolutionInstance,
@@ -47,7 +48,27 @@ export type InstanceResolutionSource = 'database' | 'env' | 'fallback';
 export type InstanceResolution = {
   resolvedInstanceName: string;
   source: InstanceResolutionSource;
+  warning?: string;
 };
+
+async function evolutionInstanceExists(instanceName: string): Promise<boolean> {
+  const status = await getEvolutionInstanceStatus(instanceName);
+  const state = status?.instance?.state || status?.state || status?.status;
+  return Boolean(state && !['not_found', 'NOT_FOUND'].includes(String(state)));
+}
+
+async function warnInvalidEnvInstanceIfNeeded(realInstanceName: string) {
+  const envInstance = process.env.EVOLUTION_INSTANCE_NAME;
+  if (!envInstance || envInstance === realInstanceName) return;
+
+  const exists = await evolutionInstanceExists(envInstance);
+  if (!exists) {
+    console.warn(
+      `EVOLUTION_INSTANCE_NAME aponta para uma instância inexistente: ${envInstance}. ` +
+      `Usando instância real encontrada no banco: ${realInstanceName}.`
+    );
+  }
+}
 
 export async function resolveWhatsAppInstance(remoteJid?: string): Promise<InstanceResolution> {
   const admin = createAdminClient();
@@ -82,6 +103,7 @@ export async function resolveWhatsAppInstance(remoteJid?: string): Promise<Insta
       .maybeSingle();
 
     if (!error && crmInstance?.instance_name) {
+      await warnInvalidEnvInstanceIfNeeded(crmInstance.instance_name);
       const resolution = { resolvedInstanceName: crmInstance.instance_name, source: 'database' as const };
       console.log('[instance] resolved', resolution);
       return resolution;
@@ -100,6 +122,7 @@ export async function resolveWhatsAppInstance(remoteJid?: string): Promise<Insta
       .maybeSingle();
 
     if (!chatError && latestUserChat?.instance_name) {
+      await warnInvalidEnvInstanceIfNeeded(latestUserChat.instance_name);
       const resolution = {
         resolvedInstanceName: latestUserChat.instance_name,
         source: 'database' as const,
@@ -115,13 +138,28 @@ export async function resolveWhatsAppInstance(remoteJid?: string): Promise<Insta
 
   // 3. Variavel de ambiente configurada para a instancia real da Evolution
   if (process.env.EVOLUTION_INSTANCE_NAME) {
-    const resolution = {
-      resolvedInstanceName: process.env.EVOLUTION_INSTANCE_NAME,
-      source: 'env' as const,
-    };
-    console.log('[instance] resolved', resolution);
-    return resolution;
+    const envInstance = process.env.EVOLUTION_INSTANCE_NAME;
+    const exists = await evolutionInstanceExists(envInstance);
+    if (!exists) {
+      console.warn(
+        `[instance] EVOLUTION_INSTANCE_NAME aponta para uma instância inexistente: ${envInstance}.`
+      );
+    } else {
+      const resolution = {
+        resolvedInstanceName: envInstance,
+        source: 'env' as const,
+      };
+      console.log('[instance] resolved', resolution);
+      return resolution;
+    }
   }
+
+  /*
+   * Intentionally do not fall back to the latest global whatsapp_chats row.
+   * That can cross users and can override an invalid EVOLUTION_INSTANCE_NAME
+   * with another account's instance.
+   */
+  if (false) return { resolvedInstanceName: fallback, source: 'fallback' as const };
 
   // 4. Registro mais recente no banco
   const { data: latest } = await admin
@@ -321,7 +359,7 @@ async function saveChatRows(admin: ReturnType<typeof createAdminClient>, rows: R
 
   const { error, data } = await admin
     .from('whatsapp_chats')
-    .upsert(rows, { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false })
+    .upsert(rows, { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false })
     .select('id');
 
   if (!error) return data?.length || rows.length;
@@ -339,6 +377,7 @@ async function saveChatRows(admin: ReturnType<typeof createAdminClient>, rows: R
     const { data: existing, error: lookupError } = await admin
       .from('whatsapp_chats')
       .select('id')
+      .eq('user_id', row.user_id)
       .eq('instance_name', row.instance_name)
       .eq('remote_jid', row.remote_jid)
       .limit(1)
@@ -369,7 +408,7 @@ async function saveMessageRows(admin: ReturnType<typeof createAdminClient>, rows
 
   const { error, data } = await admin
     .from('whatsapp_messages')
-    .upsert(rows, { onConflict: 'message_id', ignoreDuplicates: false })
+    .upsert(rows, { onConflict: 'user_id,instance_name,remote_jid,message_id', ignoreDuplicates: false })
     .select('id');
 
   if (!error) return data?.length || rows.length;
@@ -387,6 +426,9 @@ async function saveMessageRows(admin: ReturnType<typeof createAdminClient>, rows
     const { data: existing, error: lookupError } = await admin
       .from('whatsapp_messages')
       .select('id')
+      .eq('user_id', row.user_id)
+      .eq('instance_name', row.instance_name)
+      .eq('remote_jid', row.remote_jid)
       .eq('message_id', row.message_id)
       .limit(1)
       .maybeSingle();
@@ -402,6 +444,59 @@ async function saveMessageRows(admin: ReturnType<typeof createAdminClient>, rows
     } else {
       const { error: insertError } = await admin
         .from('whatsapp_messages')
+        .insert(row);
+      if (insertError) throw insertError;
+    }
+    saved += 1;
+  }
+
+  return saved;
+}
+
+async function saveContactRows(admin: ReturnType<typeof createAdminClient>, rows: ReturnType<typeof contactToRow>[]) {
+  if (!rows.length) return 0;
+
+  const { error, data } = await admin
+    .from('whatsapp_contacts')
+    .upsert(rows, { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false })
+    .select('id');
+
+  if (!error) return data?.length || rows.length;
+  if (error.code === '42P01' || error.code === 'PGRST205') {
+    logSync('contacts skipped - whatsapp_contacts unavailable', { message: error.message });
+    return 0;
+  }
+
+  const missingConflict =
+    error.message?.includes('no unique or exclusion constraint') ||
+    error.code === '42P10';
+
+  if (!missingConflict) throw error;
+
+  logSync('contact upsert fallback - unique constraint unavailable', { rows: rows.length });
+
+  let saved = 0;
+  for (const row of rows) {
+    const { data: existing, error: lookupError } = await admin
+      .from('whatsapp_contacts')
+      .select('id')
+      .eq('user_id', row.user_id)
+      .eq('instance_name', row.instance_name)
+      .eq('remote_jid', row.remote_jid)
+      .limit(1)
+      .maybeSingle();
+
+    if (lookupError) throw lookupError;
+
+    if (existing?.id) {
+      const { error: updateError } = await admin
+        .from('whatsapp_contacts')
+        .update(row)
+        .eq('id', existing.id);
+      if (updateError) throw updateError;
+    } else {
+      const { error: insertError } = await admin
+        .from('whatsapp_contacts')
         .insert(row);
       if (insertError) throw insertError;
     }
@@ -473,22 +568,7 @@ export async function syncWhatsAppChats(): Promise<{
     logSync('chats saved', { count: chatsImported });
 
     const contactRows = contacts.map((contact) => contactToRow(userId, instanceName, contact));
-    let contactsImported = 0;
-    if (contactRows.length) {
-      const { error, data } = await admin
-        .from('whatsapp_contacts')
-        .upsert(contactRows, { onConflict: 'instance_name,remote_jid', ignoreDuplicates: false })
-        .select('id');
-      if (error) {
-        if (error.code === '42P01' || error.code === 'PGRST205') {
-          logSync('contacts skipped - whatsapp_contacts unavailable', { message: error.message });
-        } else {
-          throw error;
-        }
-      } else {
-        contactsImported = data?.length || contactRows.length;
-      }
-    }
+    const contactsImported = await saveContactRows(admin, contactRows);
     logSync('contacts saved', { count: contactsImported });
 
     const messageRows: any[] = [];
@@ -536,7 +616,7 @@ export async function syncWhatsAppChats(): Promise<{
         sync_error: null,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: 'instance_name', ignoreDuplicates: false }
+      { onConflict: 'user_id,instance_name', ignoreDuplicates: false }
     ).then(({ error }) => {
       if (error && error.code !== '42P01') {
         console.warn('[whatsapp-sync] failed to update whatsapp_instances:', error.message);
@@ -582,6 +662,95 @@ export async function syncWhatsAppChats(): Promise<{
 // ============================================================
 // Inbox — listar conversas (de whatsapp_chats, já sincronizado)
 // ============================================================
+
+export async function syncMessagesForChat(
+  instanceName: string,
+  remoteJid: string,
+  options: {
+    limit: number;
+    page?: number;
+    cursor?: string;
+    direction?: 'older' | 'newer';
+    userId?: string;
+  }
+) {
+  const admin = createAdminClient();
+  const limit = Math.min(Math.max(options.limit || 50, 1), 200);
+  const userId = options.userId || await (await createServerSupabase()).auth.getUser()
+    .then(({ data }) => data.user?.id);
+
+  if (!userId) throw new Error('Unauthorized');
+
+  try {
+    const messages = await getEvolutionMessages(instanceName, remoteJid, limit);
+    const rows = messages
+      .map((msg) => messageToRow(userId, instanceName, msg, remoteJid))
+      .filter((row) => row.remote_jid && row.message_id);
+
+    const imported = await saveMessageRows(admin, rows);
+    logSync('chat messages synced', {
+      instanceName,
+      remoteJid,
+      requestedLimit: limit,
+      found: messages.length,
+      imported,
+      page: options.page,
+      cursor: options.cursor,
+      direction: options.direction,
+    });
+
+    return { success: true, remoteJid, found: messages.length, imported };
+  } catch (error: any) {
+    logSyncError('chat messages sync failed', error, { instanceName, remoteJid });
+    return {
+      success: false,
+      remoteJid,
+      imported: 0,
+      error: error?.message || 'Erro ao sincronizar mensagens da conversa',
+    };
+  }
+}
+
+export async function syncRecentMessagesForAllChats(instanceName?: string) {
+  const supabase = await createServerSupabase();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Unauthorized' };
+
+  const resolved = instanceName || (await getActiveInstanceName());
+  const admin = createAdminClient();
+  const { data: chats, error } = await admin
+    .from('whatsapp_chats')
+    .select('remote_jid')
+    .eq('user_id', user.id)
+    .eq('instance_name', resolved)
+    .order('last_message_at', { ascending: false, nullsFirst: false })
+    .limit(10);
+
+  if (error) throw error;
+
+  let imported = 0;
+  const errors: Array<{ remoteJid: string; error: string }> = [];
+
+  for (const chat of chats || []) {
+    const result = await syncMessagesForChat(resolved, chat.remote_jid, {
+      limit: 50,
+      userId: user.id,
+    });
+    if (result.success) {
+      imported += result.imported;
+    } else {
+      errors.push({ remoteJid: chat.remote_jid, error: result.error || 'Erro desconhecido' });
+    }
+  }
+
+  return {
+    success: errors.length === 0,
+    instanceName: resolved,
+    chatsProcessed: chats?.length || 0,
+    messagesImported: imported,
+    errors,
+  };
+}
 
 export async function getInboxContacts(): Promise<any[]> {
   try {
@@ -681,7 +850,7 @@ export async function getChatHistory(remoteJid: string): Promise<any[]> {
     // Persiste sem lançar erro se já existir (ignoreDuplicates)
     await adminClient
       .from('whatsapp_messages')
-      .upsert(rows, { onConflict: 'message_key', ignoreDuplicates: true });
+      .upsert(rows, { onConflict: 'user_id,instance_name,remote_jid,message_id', ignoreDuplicates: true });
 
     return rows.map(normalizeMessage);
   } catch (error: any) {
@@ -924,7 +1093,7 @@ export async function startNewConversation(
         is_group: false,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: 'instance_name,remote_jid', ignoreDuplicates: true }
+      { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: true }
     );
 
     return { success: true, remoteJid };

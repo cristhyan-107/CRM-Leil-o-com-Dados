@@ -15,6 +15,47 @@ import {
 
 export const dynamic = 'force-dynamic';
 
+async function tableExists(admin: ReturnType<typeof createAdminClient>, table: string) {
+  const { error } = await admin.from(table).select('id').limit(1);
+  return !error;
+}
+
+async function countRows(
+  admin: ReturnType<typeof createAdminClient>,
+  table: string,
+  instanceName: string
+) {
+  const { count, error } = await admin
+    .from(table)
+    .select('id', { count: 'exact', head: true })
+    .eq('instance_name', instanceName);
+  return error ? 0 : count || 0;
+}
+
+async function hasUniqueConstraint(
+  admin: ReturnType<typeof createAdminClient>,
+  table: string,
+  conflict: string,
+  instanceName: string
+) {
+  const { data } = await admin
+    .from(table)
+    .select('*')
+    .eq('instance_name', instanceName)
+    .limit(1)
+    .maybeSingle();
+
+  if (!data) return false;
+
+  const { error } = await admin
+    .from(table)
+    .upsert(data, { onConflict: conflict, ignoreDuplicates: false })
+    .select('id')
+    .limit(1);
+
+  return !error;
+}
+
 export async function GET() {
   const errors: string[] = [];
 
@@ -85,6 +126,30 @@ export async function GET() {
 
     if (readError) errors.push(`database read: ${readError.message}`);
 
+    const schema = {
+      whatsappInstancesExists: await tableExists(admin, 'whatsapp_instances'),
+      whatsappContactsExists: await tableExists(admin, 'whatsapp_contacts'),
+      whatsappChatsUniqueConstraint: await hasUniqueConstraint(
+        admin,
+        'whatsapp_chats',
+        'user_id,instance_name,remote_jid',
+        instanceName
+      ),
+      whatsappMessagesUniqueConstraint: await hasUniqueConstraint(
+        admin,
+        'whatsapp_messages',
+        'user_id,instance_name,remote_jid,message_id',
+        instanceName
+      ),
+    };
+
+    const savedData = {
+      instancesSaved: await countRows(admin, 'whatsapp_instances', instanceName),
+      contactsSaved: await countRows(admin, 'whatsapp_contacts', instanceName),
+      chatsSaved: await countRows(admin, 'whatsapp_chats', instanceName),
+      messagesSaved: await countRows(admin, 'whatsapp_messages', instanceName),
+    };
+
     return NextResponse.json({
       crmInstanceFound: Boolean(crmInstance) || instanceNameSource === 'database',
       evolutionReachable,
@@ -99,6 +164,8 @@ export async function GET() {
       databaseReadOk: !readError,
       savedChatsFound: savedChats?.length || 0,
       syncSummary: syncResult.summary || null,
+      schema,
+      savedData,
       errors,
     });
   } catch (error: any) {
@@ -119,6 +186,18 @@ export async function GET() {
         messagesFound: 0,
         databaseWriteOk: false,
         databaseReadOk: false,
+        schema: {
+          whatsappInstancesExists: false,
+          whatsappContactsExists: false,
+          whatsappChatsUniqueConstraint: false,
+          whatsappMessagesUniqueConstraint: false,
+        },
+        savedData: {
+          instancesSaved: 0,
+          contactsSaved: 0,
+          chatsSaved: 0,
+          messagesSaved: 0,
+        },
         errors,
       },
       { status: 500 }
