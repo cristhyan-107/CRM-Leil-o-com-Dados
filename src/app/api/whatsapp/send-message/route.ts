@@ -159,7 +159,14 @@ export async function POST(req: Request) {
       );
     if (chatError) throw chatError;
 
-    return NextResponse.json({ success: true, message: saved, diagnostics });
+    return NextResponse.json({
+      success: true,
+      sendStrategy: phone ? 'phone_jid' : 'lid_direct',
+      resolvedSendJid: phone ? `${phone}@s.whatsapp.net` : remoteJid,
+      evolutionEndpoint: diagnostics.endpoint,
+      message: saved,
+      diagnostics,
+    });
   } catch (error: any) {
     console.error('[whatsapp-send] failed', {
       ...diagnostics,

@@ -65,9 +65,14 @@ interface Contact {
   unreadCount: number;
   profilePicUrl: string | null;
   displayName?: string;
+  displayNameSource?: string;
   phoneNumber?: string;
+  formattedPhone?: string;
   avatarFallback?: string;
   isLead: boolean;
+  isLid?: boolean;
+  canSendMessage?: boolean;
+  sendJid?: string | null;
 }
 
 interface Message {
@@ -157,18 +162,21 @@ export function ChatInterface({
       initialJidHandled.current = true;
     } else if (!isLoadingInbox) {
       // Contato não está no inbox (nova conversa ou não sincronizada)
-      // Criar contato sintético para abrir a janela de chat
-      const phone = initialJid.split('@')[0];
+      // Criar contato sintético — usar 'Contato WhatsApp' se for @lid
+      const isLid = initialJid.includes('@lid');
+      const phonePart = isLid ? '' : initialJid.split('@')[0];
+      const displayName = isLid ? 'Contato WhatsApp' : (phonePart || 'Contato WhatsApp');
       setSelectedContact({
         id: `synthetic_${initialJid}`,
-        phone,
+        phone: phonePart,
         remoteJid: initialJid,
-        name: phone,
+        name: displayName,
         lastMessage: '',
         timestamp: new Date().toISOString(),
         unreadCount: 0,
         profilePicUrl: null,
         isLead: false,
+        isLid,
       });
       initialJidHandled.current = true;
     }
@@ -455,19 +463,27 @@ export function ChatInterface({
     const result = await startNewConversation(newConvPhone.trim());
 
     if (result.success && result.remoteJid) {
-      const phone = result.remoteJid.split('@')[0];
-      const syntheticContact: Contact = {
-        id: `new_${result.remoteJid}`,
-        phone,
+      // Use backend-returned data — never parse JID in frontend
+      const chat = result.chat;
+      const newContact: Contact = {
+        id: chat?.id || `new_${result.remoteJid}`,
+        phone: chat?.formattedPhone || '',
         remoteJid: result.remoteJid,
-        name: newConvPhone.trim(),
+        name: chat?.displayName || chat?.formattedPhone || 'Contato WhatsApp',
+        displayName: chat?.displayName,
+        displayNameSource: chat?.displayNameSource,
+        phoneNumber: chat?.phoneNumber,
+        formattedPhone: chat?.formattedPhone,
+        avatarFallback: chat?.avatarFallback,
+        canSendMessage: chat?.canSendMessage ?? true,
+        sendJid: chat?.sendJid,
         lastMessage: '',
         timestamp: new Date().toISOString(),
         unreadCount: 0,
-        profilePicUrl: null,
+        profilePicUrl: chat?.profilePicUrl || null,
         isLead: false,
       };
-      setSelectedContact(syntheticContact);
+      setSelectedContact(newContact);
       setNewConvPhone('');
       setShowNewConv(false);
       loadInbox(); // atualizar lista (novo contato pode já estar lá)
@@ -701,14 +717,29 @@ export function ChatInterface({
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
-                <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-900/40 to-gray-800 flex items-center justify-center border border-white/[0.08] text-xs font-semibold text-blue-300">
-                  {selectedContact.avatarFallback || getInitials(selectedContact.name)}
-                </div>
+                {selectedContact.profilePicUrl ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={selectedContact.profilePicUrl}
+                    alt={selectedContact.name}
+                    className="w-9 h-9 rounded-full object-cover border border-white/[0.08]"
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                  />
+                ) : (
+                  <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-900/40 to-gray-800 flex items-center justify-center border border-white/[0.08] text-xs font-semibold text-blue-300">
+                    {selectedContact.avatarFallback || getInitials(selectedContact.name)}
+                  </div>
+                )}
                 <div>
                   <h3 className="font-semibold text-white text-sm">
                     {selectedContact.name}
                   </h3>
-                  <p className="text-xs text-gray-500">{selectedContact.phone}</p>
+                  {selectedContact.formattedPhone && selectedContact.formattedPhone !== selectedContact.name && (
+                    <p className="text-xs text-gray-500">{selectedContact.formattedPhone}</p>
+                  )}
+                  {!selectedContact.formattedPhone && selectedContact.phone && !selectedContact.phone.includes('@') && (
+                    <p className="text-xs text-gray-500">{selectedContact.phone}</p>
+                  )}
                 </div>
               </div>
               <button

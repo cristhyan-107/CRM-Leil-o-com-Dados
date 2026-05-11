@@ -26,6 +26,7 @@ import {
   isLidJid,
   normalizeWhatsAppJid,
   resolveContactDisplayName,
+  resolveContactIdentity,
   resolveProfilePicture,
 } from '@/lib/whatsapp-normalize';
 
@@ -1105,31 +1106,35 @@ export async function getInboxContacts(): Promise<any[]> {
     const remoteJids = data.map((chat) => chat.remote_jid).filter(Boolean);
     const { data: contacts } = await admin
       .from('whatsapp_contacts')
-      .select('remote_jid, display_name, push_name, verified_name, phone_number, profile_pic_url')
+      .select('remote_jid, display_name, push_name, verified_name, business_name, phone_number, profile_pic_url')
       .eq('instance_name', instanceName)
       .in('remote_jid', remoteJids.length ? remoteJids : ['']);
     const contactByJid = new Map((contacts || []).map((contact: any) => [contact.remote_jid, contact]));
 
     return data.map((chat: any) => {
       const contact = contactByJid.get(chat.remote_jid);
-      const phoneRaw = contact?.phone_number || chat.phone_number || extractPhoneFromJid(chat.remote_jid);
-      const displayName = resolveContactDisplayName({ contact, chat, remoteJid: chat.remote_jid });
+      const identity = resolveContactIdentity({ contact, chat, remoteJid: chat.remote_jid });
       return {
         id: chat.id,
-        phone: phoneRaw ? formatBrazilianPhone(phoneRaw) : '',
-        phoneNumber: phoneRaw ? formatBrazilianPhone(phoneRaw) : '',
+        phone: identity.formattedPhone || '',
+        phoneNumber: identity.formattedPhone || '',
+        formattedPhone: identity.formattedPhone || '',
         remoteJid: chat.remote_jid,
-        displayName,
-        name: displayName,
-        avatarFallback: avatarFallback(displayName),
+        displayName: identity.displayName,
+        displayNameSource: identity.displayNameSource,
+        name: identity.displayName,
+        avatarFallback: identity.avatarFallback,
         lastMessage: chat.last_message_text || chat.last_message || '',
         lastMessageText: chat.last_message_text || chat.last_message || '',
         timestamp: chat.last_message_at || chat.updated_at,
         lastMessageAt: chat.last_message_at || chat.updated_at,
         unreadCount: chat.unread_count || 0,
-        profilePicUrl: resolveProfilePicture({ contact, chat }),
+        profilePicUrl: identity.profilePicUrl,
         isLead: false,
-        isLid: isLidJid(chat.remote_jid),
+        isLid: identity.isLid,
+        isGroup: identity.isGroup,
+        canSendMessage: identity.canSendMessage,
+        sendJid: identity.sendJid,
       };
     });
   } catch (error: any) {
@@ -1408,8 +1413,9 @@ export async function sendChatMessage(
 // ============================================================
 
 export async function startNewConversation(
-  phone: string
-): Promise<{ success: boolean; remoteJid?: string; error?: string }> {
+  phone: string,
+  initialMessage?: string
+): Promise<{ success: boolean; remoteJid?: string; chat?: any; error?: string }> {
   try {
     const supabase = await createServerSupabase();
     const {
@@ -1419,25 +1425,89 @@ export async function startNewConversation(
 
     const instanceName = await getActiveInstanceName();
 
+    // Normalize phone
     const digits = phone.replace(/\D/g, '');
-    if (digits.length < 8) return { success: false, error: 'Número inválido' };
+    if (digits.length < 10) return { success: false, error: 'Número inválido. Mínimo 10 dígitos (DDD + número).' };
     const fullNumber = digits.startsWith('55') ? digits : `55${digits}`;
+    if (fullNumber.length < 12 || fullNumber.length > 13) {
+      return { success: false, error: 'Número inválido. Verifique DDD e número.' };
+    }
     const remoteJid = `${fullNumber}@s.whatsapp.net`;
+    const formattedPhone = formatBrazilianPhone(fullNumber);
+    const now = new Date().toISOString();
 
-    // Garantir que o chat existe na tabela para aparecer no inbox
-    await supabase.from('whatsapp_chats').upsert(
+    // Use admin client to bypass RLS
+    const admin = createAdminClient();
+    const { error: upsertError } = await admin.from('whatsapp_chats').upsert(
       {
         user_id: user.id,
         instance_name: instanceName,
         remote_jid: remoteJid,
-        push_name: phone,
+        phone_number: fullNumber,
+        chat_name: formattedPhone,
+        push_name: formattedPhone,
         is_group: false,
-        updated_at: new Date().toISOString(),
+        last_message_text: initialMessage || '',
+        last_message_at: now,
+        updated_at: now,
       },
-      { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: true }
+      { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
     );
 
-    return { success: true, remoteJid };
+    if (upsertError) {
+      console.error('[startNewConversation] upsert error:', upsertError);
+      return { success: false, error: `Erro ao criar conversa: ${upsertError.message}` };
+    }
+
+    // Also upsert contact
+    await admin.from('whatsapp_contacts').upsert(
+      {
+        user_id: user.id,
+        instance_name: instanceName,
+        remote_jid: remoteJid,
+        phone_number: fullNumber,
+        display_name: formattedPhone,
+        push_name: formattedPhone,
+        updated_at: now,
+      },
+      { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
+    );
+
+    // Send initial message if provided
+    if (initialMessage?.trim()) {
+      try {
+        await sendEvolutionMessage(instanceName, fullNumber, initialMessage.trim());
+      } catch (sendErr: any) {
+        console.warn('[startNewConversation] send failed:', sendErr?.message);
+        // Don't fail the whole operation — chat was created
+      }
+    }
+
+    // Fetch the created chat to return its ID
+    const { data: createdChat } = await admin
+      .from('whatsapp_chats')
+      .select('id')
+      .eq('user_id', user.id)
+      .eq('instance_name', instanceName)
+      .eq('remote_jid', remoteJid)
+      .maybeSingle();
+
+    return {
+      success: true,
+      remoteJid,
+      chat: {
+        id: createdChat?.id || `new_${remoteJid}`,
+        remoteJid,
+        sendJid: remoteJid,
+        displayName: formattedPhone,
+        displayNameSource: 'phone',
+        phoneNumber: fullNumber,
+        formattedPhone,
+        profilePicUrl: null,
+        avatarFallback: fullNumber.slice(-2),
+        canSendMessage: true,
+      },
+    };
   } catch (error: any) {
     console.error('[startNewConversation]', error.message);
     return { success: false, error: error.message };

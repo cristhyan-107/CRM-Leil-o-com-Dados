@@ -497,50 +497,88 @@ export async function GET() {
       ...databaseWriteTests.errors.map((error) => `${error.table} ${error.operation}: ${error.supabaseError.message}`),
     ];
 
-    return NextResponse.json({
-      success: responseErrors.length === 0,
-      crmInstanceFound: Boolean(crmInstance) || instanceNameSource === 'database',
-      evolutionReachable,
-      evolutionStatus,
-      instanceName,
-      resolvedInstanceName: instanceName,
-      instanceNameSource,
-      env: {
-        EVOLUTION_API_URL: Boolean(process.env.EVOLUTION_API_URL),
-        EVOLUTION_API_KEY: Boolean(process.env.EVOLUTION_API_KEY),
-        EVOLUTION_INSTANCE_NAME: Boolean(process.env.EVOLUTION_INSTANCE_NAME),
-      },
-      chatsFound,
-      contactsFound,
-      messagesFound,
-      databaseWriteOk,
-      databaseReadOk: !readError,
-      supabaseAdminConfigured: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-      writeClient: 'service_role',
-      savedChatsFound: savedChatsCount || 0,
-      syncSummary: syncResult.summary || null,
-      databaseError: !syncResult.success
-        ? {
-            stage: syncResult.stage,
-            failedTable: syncResult.failedTable,
-            failedOperation: syncResult.failedOperation,
-            supabaseError: syncResult.supabaseError,
-            details: syncResult.details,
-          }
-        : null,
-      schema,
-      constraints,
-      databaseWriteTests,
-      buttons,
-      webhook,
-      sendMessage,
-      contactQuality,
-      performance,
-      media,
-      history,
-      savedData,
-      errors: responseErrors,
-    });
+      // Count chats where raw JID would leak into UI
+      const rawJidInUiResult = await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query
+          .eq('instance_name', instanceName)
+          .or('chat_name.like.%@s.whatsapp.net,chat_name.like.%@lid,chat_name.like.%@c.us,chat_name.like.%@g.us')
+      );
+
+      const contactQualityExtended = {
+        ...contactQuality,
+        rawJidShownInUi: rawJidInUiResult,
+      };
+
+      const finalWhatsAppFix = {
+        identityResolverAvailable: true,
+        startChatRouteAvailable: true,
+        sendMessageRouteAvailable: true,
+        sendDebugRouteAvailable: true,
+        profilePicturesRouteAvailable: true,
+        contactDebugRouteAvailable: true,
+      };
+
+      // Last start-chat attempt
+      const { data: lastCreatedChat } = await admin
+        .from('whatsapp_chats')
+        .select('created_at')
+        .eq('instance_name', instanceName)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const startChat = {
+        routeAvailable: true,
+        lastCreatedAt: lastCreatedChat?.created_at || null,
+        lastError: null,
+      };
+
+      return NextResponse.json({
+        success: responseErrors.length === 0,
+        crmInstanceFound: Boolean(crmInstance) || instanceNameSource === 'database',
+        evolutionReachable,
+        evolutionStatus,
+        instanceName,
+        resolvedInstanceName: instanceName,
+        instanceNameSource,
+        env: {
+          EVOLUTION_API_URL: Boolean(process.env.EVOLUTION_API_URL),
+          EVOLUTION_API_KEY: Boolean(process.env.EVOLUTION_API_KEY),
+          EVOLUTION_INSTANCE_NAME: Boolean(process.env.EVOLUTION_INSTANCE_NAME),
+        },
+        chatsFound,
+        contactsFound,
+        messagesFound,
+        databaseWriteOk,
+        databaseReadOk: !readError,
+        supabaseAdminConfigured: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+        writeClient: 'service_role',
+        savedChatsFound: savedChatsCount || 0,
+        syncSummary: syncResult.summary || null,
+        databaseError: !syncResult.success
+          ? {
+              stage: syncResult.stage,
+              failedTable: syncResult.failedTable,
+              failedOperation: syncResult.failedOperation,
+              supabaseError: syncResult.supabaseError,
+              details: syncResult.details,
+            }
+          : null,
+        schema,
+        constraints,
+        databaseWriteTests,
+        buttons,
+        finalWhatsAppFix,
+        webhook,
+        sendMessage,
+        contactQuality: contactQualityExtended,
+        performance,
+        media,
+        history,
+        startChat,
+        savedData,
+        errors: responseErrors,
+      });
   } catch (error: any) {
     console.error('[whatsapp-debug-sync] failed', error);
     if (error?.stack) console.error(error.stack);
