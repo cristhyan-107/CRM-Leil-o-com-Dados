@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
+import { createServerSupabase } from '@/lib/supabase/server';
 import {
   extractMessageTextFromPayload,
   extractPhoneFromJid,
@@ -14,6 +15,50 @@ import {
 } from '@/lib/whatsapp-normalize';
 
 export const dynamic = 'force-dynamic';
+
+// ============================================================
+// GET — List recent webhook events (for diagnostics)
+// ============================================================
+
+export async function GET(req: Request) {
+  const supabase = await createServerSupabase();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const url = new URL(req.url);
+  const limit = Math.min(Number(url.searchParams.get('limit') || 50), 100);
+  const admin = createAdminClient();
+
+  const { data: events, error } = await admin
+    .from('whatsapp_webhook_events')
+    .select('id, received_at, instance_name, event_raw, event_normalized, remote_jid, message_id, from_me, secret_valid, processed, saved_contact, saved_chat, saved_message, error_message')
+    .order('received_at', { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
+
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const last24h = (events || []).filter((e: any) => e.received_at >= since24h);
+
+  return NextResponse.json({
+    success: true,
+    total: events?.length || 0,
+    last24hCount: last24h.length,
+    messagesSavedLast24h: last24h.filter((e: any) => e.saved_message).length,
+    secretValidCount: (events || []).filter((e: any) => e.secret_valid).length,
+    secretInvalidCount: (events || []).filter((e: any) => !e.secret_valid).length,
+    events: (events || []).map((e: any) => ({
+      ...e,
+      raw_payload: undefined, // Don't expose large payloads
+    })),
+  });
+}
+
+// ============================================================
+// POST — Process incoming webhook events
+// ============================================================
 
 type WebhookProcessResult = {
   processed: boolean;

@@ -124,16 +124,35 @@ export function resolveContactDisplayName({
     chat?.push_name,
     message?.sender_name,
     message?.pushName,
-    phone ? formatBrazilianPhone(phone) : '',
   ];
 
   const rawJid = normalizeWhatsAppJid(remoteJid || chat?.remote_jid || contact?.remote_jid);
+  const isLid = isLidJid(rawJid);
+
   for (const candidate of candidates) {
     const value = String(candidate || '').trim();
-    if (value && value !== rawJid && !value.endsWith('@lid')) return value;
+    // Never return raw JIDs or @lid identifiers
+    if (
+      value &&
+      value !== rawJid &&
+      !value.endsWith('@lid') &&
+      !value.endsWith('@s.whatsapp.net') &&
+      !value.endsWith('@g.us') &&
+      !value.includes('@broadcast')
+    ) {
+      return value;
+    }
   }
 
+  // If we have a real phone number, format it nicely
+  if (phone) return formatBrazilianPhone(phone);
+
+  // For @lid without any name or phone, use a friendly label
+  if (isLid) return 'Contato WhatsApp';
+
+  // For normal JIDs without name, extract the number part
   if (rawJid && !isLidJid(rawJid)) return rawJid.split('@')[0];
+
   return 'Contato sem nome';
 }
 

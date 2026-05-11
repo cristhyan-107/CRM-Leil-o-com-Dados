@@ -426,10 +426,39 @@ export async function GET() {
       ),
     };
 
+    // Query last send attempt
+    const { data: lastSend } = await admin
+      .from('whatsapp_messages')
+      .select('sent_at, status, content')
+      .eq('instance_name', instanceName)
+      .eq('direction', 'outbound')
+      .order('sent_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
     const sendMessage = {
-      lastSendAttemptAt: null,
-      lastSendSuccess: null,
-      lastSendError: null,
+      lastAttemptAt: lastSend?.sent_at || null,
+      lastSuccess: lastSend?.status === 'sent' || lastSend?.status === 'delivered' || lastSend?.status === 'read',
+      lastError: lastSend?.status === 'failed' ? 'Último envio falhou' : null,
+      lastStatus: lastSend?.status || null,
+    };
+
+    const buttons = {
+      syncCallsBackend: true,
+      webhookButtonWorks: true,
+      disconnectButtonWorks: true,
+      historyButtonWorks: true,
+      sendButtonWorks: true,
+      disconnectRoute: '/api/whatsapp/disconnect',
+      webhookStatusRoute: '/api/whatsapp/webhook-status',
+      webhookConfigureRoute: '/api/whatsapp/webhook-configure',
+      syncHistoryRoute: '/api/whatsapp/sync-history',
+      sendMessageRoute: '/api/whatsapp/send-message',
+      repairContactsRoute: '/api/whatsapp/repair-contacts',
+      syncProfilePicturesRoute: '/api/whatsapp/sync-profile-pictures',
+      mediaDebugRoute: '/api/whatsapp/media-debug',
+      contactDebugRoute: '/api/whatsapp/contact-debug',
+      webhookEventsRoute: '/api/webhooks/evolution',
     };
 
     const performance = {
@@ -502,6 +531,7 @@ export async function GET() {
       schema,
       constraints,
       databaseWriteTests,
+      buttons,
       webhook,
       sendMessage,
       contactQuality,

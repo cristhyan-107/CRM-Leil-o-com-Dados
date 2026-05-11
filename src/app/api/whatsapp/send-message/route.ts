@@ -44,6 +44,8 @@ export async function POST(req: Request) {
     .maybeSingle();
 
   const instanceName = chat?.instance_name || (await resolveWhatsAppInstance(remoteJid)).resolvedInstanceName;
+
+  // Resolve phone from multiple sources
   const { data: contact } = await admin
     .from('whatsapp_contacts')
     .select('phone_number')
@@ -53,11 +55,13 @@ export async function POST(req: Request) {
     .limit(1)
     .maybeSingle();
 
+  // Check raw_payload for alternative JID (rare but exists)
   const { data: altMessage } = await admin
     .from('whatsapp_messages')
     .select('raw_payload')
     .eq('instance_name', instanceName)
     .eq('remote_jid', remoteJid)
+    .not('raw_payload', 'is', null)
     .order('created_at', { ascending: false })
     .limit(20);
 
@@ -65,33 +69,32 @@ export async function POST(req: Request) {
     .map((row: any) => row?.raw_payload?.key?.remoteJidAlt)
     .find(Boolean) || '';
   const phone = contact?.phone_number || chat?.phone_number || extractPhoneFromJid(altJid) || extractPhoneFromJid(remoteJid);
+
+  const isLid = isLidJid(remoteJid);
   const diagnostics = {
-    stage: 'evolutionSend',
     endpoint: getEvolutionUrl(`/message/sendText/${instanceName}`),
     instanceName,
     remoteJid,
-    resolvedSendJid: altJid || remoteJid,
+    chatId: chat?.id || null,
+    resolvedSendJid: phone ? null : remoteJid,
     phoneNumber: phone || null,
-    isLid: isLidJid(remoteJid),
+    isLid,
     phoneResolved: Boolean(phone),
+    sendStrategy: phone ? 'phone' : 'remoteJid',
   };
 
-  if (!phone) {
+  // For normal (non-lid) contacts without phone: fail with clear error
+  if (!phone && !isLid) {
     return NextResponse.json(
       {
         success: false,
-        stage: 'normalizeRemoteJid',
-        instanceName,
-        remoteJid,
-        resolvedSendJid: altJid || remoteJid,
-        phoneNumber: null,
-        isLid: isLidJid(remoteJid),
+        stage: 'resolvePhone',
+        ...diagnostics,
         evolutionEndpoint: diagnostics.endpoint,
         evolutionStatusCode: null,
         evolutionResponse: null,
         databaseError: null,
         error: 'Não foi possível identificar telefone real para este contato.',
-        details: diagnostics,
       },
       { status: 400 }
     );
@@ -99,7 +102,10 @@ export async function POST(req: Request) {
 
   try {
     console.log('[whatsapp-send] sending', diagnostics);
-    const response = await sendEvolutionMessage(instanceName, phone, text);
+    // Send via phone number when available, otherwise via remoteJid (for @lid)
+    const response = await sendEvolutionMessage(instanceName, phone || '', text, {
+      remoteJid: phone ? undefined : remoteJid,
+    });
     const now = new Date().toISOString();
     const messageId =
       response?.key?.id ||
@@ -121,7 +127,7 @@ export async function POST(req: Request) {
       created_at: now,
       updated_at: now,
       message_timestamp: now,
-      phone_normalized: phone,
+      phone_normalized: phone || null,
       direction: 'outbound',
       provider: 'evolution',
       raw_payload: response,
@@ -141,7 +147,7 @@ export async function POST(req: Request) {
           user_id: row.user_id,
           instance_name: instanceName,
           remote_jid: remoteJid,
-          phone_number: phone,
+          phone_number: phone || null,
           last_message: text,
           last_message_text: text,
           last_message_at: now,
@@ -166,9 +172,10 @@ export async function POST(req: Request) {
         stage: error instanceof EvolutionApiError ? 'evolutionSend' : 'databaseSave',
         instanceName,
         remoteJid,
-        resolvedSendJid: altJid || remoteJid,
+        chatId: chat?.id || null,
+        resolvedSendJid: phone ? null : remoteJid,
         phoneNumber: phone || null,
-        isLid: isLidJid(remoteJid),
+        isLid,
         evolutionEndpoint: diagnostics.endpoint,
         evolutionStatusCode: error?.status || null,
         evolutionResponse: error instanceof EvolutionApiError ? safeJson(error.body) : null,
@@ -179,11 +186,7 @@ export async function POST(req: Request) {
           hint: error?.hint,
         },
         error: friendlySendError(error),
-        details: {
-          ...diagnostics,
-          statusCode: error?.status || null,
-          response: error instanceof EvolutionApiError ? error.body : error?.message,
-        },
+        details: diagnostics,
       },
       { status: error instanceof EvolutionApiError ? 502 : 500 }
     );

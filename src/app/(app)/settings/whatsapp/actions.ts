@@ -376,10 +376,44 @@ export async function connectWhatsApp() {
 
 export async function disconnectWhatsApp() {
   try {
+    const supabase = await createServerSupabase();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return { success: false, error: 'Unauthorized' };
+
     const instanceName = await getActiveInstanceName();
-    await logoutEvolutionInstance(instanceName);
-    return { success: true };
+    
+    // 1. Logout from Evolution API
+    let evolutionError: string | null = null;
+    try {
+      await logoutEvolutionInstance(instanceName);
+    } catch (err: any) {
+      // Even if Evolution fails, we still update DB to reflect user intent
+      evolutionError = err?.message || 'Erro ao desconectar da Evolution API';
+      console.warn('[disconnectWhatsApp] Evolution logout error (continuing):', evolutionError);
+    }
+
+    // 2. Update whatsapp_instances in database
+    const admin = createAdminClient();
+    const now = new Date().toISOString();
+    await admin.from('whatsapp_instances').upsert(
+      {
+        user_id: user.id,
+        instance_name: instanceName,
+        status: 'disconnected',
+        sync_status: 'idle',
+        sync_error: null,
+        updated_at: now,
+      },
+      { onConflict: 'user_id,instance_name', ignoreDuplicates: false }
+    );
+
+    return {
+      success: true,
+      instanceName,
+      evolutionError,
+    };
   } catch (error: any) {
+    console.error('[disconnectWhatsApp] failed:', error?.message);
     return { success: false, error: error.message };
   }
 }
@@ -1284,44 +1318,38 @@ export async function sendChatMessage(
 
 
     const phone = jidToPhone(remoteJid);
+    const isLid = phone ? false : true; // jidToPhone returns empty-ish for @lid
     const endpoint = `/message/sendText/${instanceName}`;
 
     diagnostics.instanceName = instanceName;
-    diagnostics.phone = phone;
+    diagnostics.phone = phone || null;
     diagnostics.endpoint = endpoint;
 
     console.log('[sendChatMessage] iniciando envio', {
       instanceName,
-      phone,
+      phone: phone || '(lid/unavailable)',
       remoteJid,
       endpoint,
       contentLen: content.length,
+      sendStrategy: phone ? 'phone' : 'remoteJid',
     });
-
-
-    console.log('\n=== [ENVIO TEMPORÁRIO] Iniciando Envio ===');
-    console.log(`Instância a ser usada: ${instanceName}`);
-    console.log(`RemoteJid destino: ${remoteJid}`);
-    console.log(`Endpoint esperado: ${endpoint}`);
 
     // Enviar via Evolution API
     let sendRes: any;
     try {
-      sendRes = await sendEvolutionMessage(instanceName, phone, content);
-      console.log(`[ENVIO TEMPORÁRIO] Sucesso na chamada à Evolution API.`);
-      console.log('==========================================\n');
+      sendRes = await sendEvolutionMessage(instanceName, phone, content, {
+        remoteJid: phone ? undefined : remoteJid,
+      });
     } catch (apiErr: unknown) {
       const errMsg = safeStr(apiErr);
-      console.error('\n[ENVIO TEMPORÁRIO] ERRO na Evolution API:');
-      console.error(`Status ou Mensagem: ${errMsg}`);
-      console.error('==========================================\n');
+      console.error('[sendChatMessage] Evolution API error:', errMsg);
       
       diagnostics.error = errMsg;
       let userFriendlyError = errMsg;
       if (errMsg.includes('404') || errMsg.includes('not exist')) {
-          userFriendlyError = 'Instância não encontrada (404). Verifique se o WhatsApp está conectado e se o nome da instância está correto na Evolution API.';
+          userFriendlyError = 'Instância não encontrada (404). Verifique se o WhatsApp está conectado.';
       } else if (errMsg.includes('401') || errMsg.includes('403')) {
-          userFriendlyError = 'Não autorizado (401/403). Verifique a EVOLUTION_API_KEY no arquivo .env.local.';
+          userFriendlyError = 'Não autorizado. Verifique a EVOLUTION_API_KEY.';
       } else if (errMsg.includes('fetch')) {
           userFriendlyError = 'Falha de rede. O CRM não conseguiu se conectar à Evolution API.';
       }
@@ -1343,7 +1371,7 @@ export async function sendChatMessage(
       sent_at: new Date().toISOString(),
       created_at: new Date().toISOString(),
       message_id: msgKey,
-      phone_normalized: phone,
+      phone_normalized: phone || null,
       direction: 'outbound',
       provider: 'evolution',
     });

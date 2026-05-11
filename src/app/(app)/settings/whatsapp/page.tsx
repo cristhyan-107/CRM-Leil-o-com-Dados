@@ -224,9 +224,15 @@ export default function WhatsAppSettingsPage() {
     if (!confirm('Deseja desconectar o WhatsApp desta conta?')) return;
     setLoading(true);
     stopPolling();
-    await disconnectWhatsApp();
-    setQrCode(null);
-    setState('DISCONNECTED');
+    const result = await disconnectWhatsApp();
+    if (result.success) {
+      setQrCode(null);
+      setState('DISCONNECTED');
+      setSyncStatus('');
+      setSyncError('');
+    } else {
+      setError(result.error || 'Falha ao desconectar');
+    }
     setLoading(false);
   };
 

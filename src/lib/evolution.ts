@@ -471,10 +471,17 @@ export async function getEvolutionMessages(
 export async function sendEvolutionMessage(
   instanceName: string,
   number: string,
-  text: string
+  text: string,
+  options?: { remoteJid?: string }
 ) {
+  // For @lid contacts or when phone is unavailable, try sending via remoteJid
+  const sendNumber = number || options?.remoteJid || '';
+  if (!sendNumber) {
+    throw new Error('Nenhum número ou remoteJid disponível para envio.');
+  }
+
   const payload = {
-    number,
+    number: sendNumber,
     // Evolution v2+: campo 'text' direto
     text,
     // Evolution v1 / legacy: campo 'textMessage' como wrapper
@@ -486,15 +493,7 @@ export async function sendEvolutionMessage(
     },
   };
 
-  // [LOG TEMPORÁRIO] 
-  console.log(`\n=== [EVOLUTION FETCH TEMPORÁRIO] ===`);
-  console.log(`Endpoint: /message/sendText/${instanceName}`);
-  console.log(`Payload enviado (seguro):`, {
-      number: payload.number,
-      text_length: payload.text.length,
-      has_textMessage: !!payload.textMessage?.text
-  });
-  console.log(`====================================\n`);
+  console.log(`[sendEvolutionMessage] Sending to ${sendNumber} via ${instanceName}`);
 
   return evolutionFetch(`/message/sendText/${instanceName}`, {
     method: 'POST',
@@ -523,4 +522,21 @@ export function extractMessageText(message?: EvolutionMessage['message']): strin
 /** Normaliza JID → número de telefone limpo */
 export function jidToPhone(jid: string): string {
   return jid.split('@')[0].split(':')[0];
+}
+
+/**
+ * Fetch media (base64) from a WhatsApp message via Evolution API v2.
+ * Endpoint: POST /chat/getBase64FromMediaMessage/{instanceName}
+ * Body: { message: { key: { ... } } }
+ */
+export async function getBase64FromMediaMessage(
+  instanceName: string,
+  messageKey: { id: string; remoteJid: string; fromMe?: boolean },
+) {
+  return evolutionFetch(`/chat/getBase64FromMediaMessage/${instanceName}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      message: { key: messageKey },
+    }),
+  });
 }

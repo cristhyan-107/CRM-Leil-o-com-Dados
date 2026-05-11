@@ -407,15 +407,35 @@ export function ChatInterface({
   async function syncSelectedHistory() {
     if (!selectedContact || selectedContact.id.startsWith('synthetic_') || selectedContact.id.startsWith('new_')) return;
     setIsSyncingHistory(true);
+    setHistoryError('');
     try {
-      await fetch('/api/whatsapp/sync-history', {
+      const syncRes = await fetch('/api/whatsapp/sync-history', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'selectedChat', chatId: selectedContact.id, limitPerChat: 500, includeMedia: false }),
       });
+      const syncData = await syncRes.json();
+
+      // Reload messages from database
       const res = await fetch(`/api/whatsapp/chats/${selectedContact.id}/messages?limit=50`);
       const data = await res.json();
       if (data.success) setMessages(data.messages || []);
+
+      // Show feedback
+      if (syncData.success) {
+        if (syncData.imported > 0) {
+          setHistoryError(`✅ ${syncData.imported} mensagens importadas.`);
+        } else {
+          setHistoryError('Não há mais mensagens disponíveis.');
+        }
+      } else {
+        const errorMsg = syncData.errors?.[0]?.error || 'Erro ao buscar histórico.';
+        setHistoryError(`❌ ${errorMsg}`);
+      }
+      // Clear feedback after 5 seconds
+      setTimeout(() => setHistoryError(''), 5000);
+    } catch (err: any) {
+      setHistoryError(`❌ ${err?.message || 'Erro ao buscar histórico'}`);
     } finally {
       setIsSyncingHistory(false);
     }
