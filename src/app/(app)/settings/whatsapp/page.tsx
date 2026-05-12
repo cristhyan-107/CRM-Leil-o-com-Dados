@@ -160,6 +160,17 @@ export default function WhatsAppSettingsPage() {
           : `Sincronização concluída: ${chats} conversas, ${messages} mensagens`
       );
       setSyncRefreshKey((value) => value + 1);
+      Promise.resolve()
+        .then(() => fetch('/api/whatsapp/repair-contacts', { method: 'POST' }))
+        .then(() =>
+          fetch('/api/whatsapp/sync-profile-pictures', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ limit: 30, onlyMissing: true }),
+          })
+        )
+        .then(() => setSyncRefreshKey((value) => value + 1))
+        .catch((err) => console.warn('[whatsapp] contact/photo refresh failed', err));
       if (false && !webhookRes.success) {
         setSyncStatus('Webhook não configurado');
         setSyncError(

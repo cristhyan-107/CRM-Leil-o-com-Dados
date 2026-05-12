@@ -13,6 +13,7 @@ import {
   getEvolutionMessages,
   getEvolutionUrl,
 } from '@/lib/evolution';
+import { isLikelyHumanName } from '@/lib/whatsapp-normalize';
 
 export const dynamic = 'force-dynamic';
 
@@ -503,10 +504,22 @@ export async function GET() {
           .eq('instance_name', instanceName)
           .or('chat_name.like.%@s.whatsapp.net,chat_name.like.%@lid,chat_name.like.%@c.us,chat_name.like.%@g.us')
       );
+      const { data: identityLeakRows } = await admin
+        .from('whatsapp_chats')
+        .select('remote_jid, chat_name, push_name, phone_number')
+        .eq('instance_name', instanceName)
+        .limit(1000);
+      const numericIdentifierLeaks = (identityLeakRows || []).filter((row: any) => {
+        const candidate = row.chat_name || row.push_name;
+        return candidate && !isLikelyHumanName(candidate, {
+          remoteJid: row.remote_jid,
+          phoneNumber: row.phone_number,
+        });
+      }).length;
 
       const contactQualityExtended = {
         ...contactQuality,
-        rawJidShownInUi: rawJidInUiResult,
+        rawJidShownInUi: rawJidInUiResult + numericIdentifierLeaks,
       };
 
       const finalWhatsAppFix = {

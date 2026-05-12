@@ -23,11 +23,16 @@ import {
   avatarFallback,
   extractPhoneFromJid,
   formatBrazilianPhone,
+  getMessageMediaInfo,
   isLidJid,
+  isLikelyHumanName,
+  isValidPhoneNumber,
+  normalizeBrazilianPhoneNumber,
   normalizeWhatsAppJid,
   resolveContactDisplayName,
   resolveContactIdentity,
   resolveProfilePicture,
+  resolveSendJid,
 } from '@/lib/whatsapp-normalize';
 
 // ============================================================
@@ -449,7 +454,10 @@ function logSyncError(step: string, error: unknown, data: Record<string, unknown
 
 function getChatDisplayName(chat: EvolutionChat) {
   const phone = jidToPhone(chat.remoteJid);
-  return chat.pushName || phone || chat.remoteJid;
+  if (isLikelyHumanName(chat.pushName, { remoteJid: chat.remoteJid, phoneNumber: phone })) {
+    return chat.pushName;
+  }
+  return phone ? formatBrazilianPhone(phone) : 'Contato WhatsApp';
 }
 
 function chatToRow(userId: string, instanceName: string, chat: EvolutionChat) {
@@ -480,16 +488,29 @@ function chatToRow(userId: string, instanceName: string, chat: EvolutionChat) {
 
 function contactToRow(userId: string, instanceName: string, contact: EvolutionContact) {
   const phone = contact.phoneNumber || jidToPhone(contact.remoteJid);
-  const name = contact.displayName || contact.pushName || contact.verifiedName || phone;
+  const identity = resolveContactIdentity({
+    contact: {
+      ...contact,
+      phone_number: phone,
+      display_name: contact.displayName,
+      push_name: contact.pushName,
+      verified_name: contact.verifiedName,
+      business_name: contact.businessName,
+      profile_pic_url: contact.profilePicUrl,
+      remote_jid: contact.remoteJid,
+    },
+    remoteJid: contact.remoteJid,
+  });
 
   return {
     user_id: userId,
     instance_name: instanceName,
     remote_jid: contact.remoteJid,
-    phone_number: phone,
-    display_name: name,
+    phone_number: identity.phoneNumber || phone || null,
+    display_name: identity.displayName,
     push_name: contact.pushName || null,
     verified_name: contact.verifiedName || null,
+    business_name: contact.businessName || null,
     profile_pic_url: contact.profilePicUrl || null,
     is_business: contact.isBusiness || false,
     is_group: contact.isGroup || contact.remoteJid.endsWith('@g.us'),
@@ -519,11 +540,8 @@ function messageToRow(
   const sentAt = msg.messageTimestamp
     ? new Date(msg.messageTimestamp * 1000).toISOString()
     : new Date().toISOString();
-  const hasMedia = Boolean(
-    msg.message?.imageMessage ||
-    msg.message?.audioMessage ||
-    msg.message?.documentMessage
-  );
+  const media = getMessageMediaInfo(msg.message);
+  const phone = extractPhoneFromJid((msg.key as any)?.remoteJidAlt) || jidToPhone(remoteJid);
 
   return {
     user_id: userId,
@@ -532,20 +550,23 @@ function messageToRow(
     remote_jid: remoteJid,
     from_me: msg.key?.fromMe ?? false,
     push_name: msg.pushName || null,
-    message_type: msg.messageType || 'conversation',
+    message_type: msg.messageType || media.type || 'conversation',
     content,
     text: content || null,
-    caption: msg.message?.imageMessage?.caption || null,
-    has_media: hasMedia,
+    caption: media.caption || null,
+    has_media: media.hasMedia,
+    media_mimetype: media.mimetype,
+    media_filename: media.filename,
+    media_url: media.url,
     message_timestamp: sentAt,
     sender_jid: msg.key?.participant || (msg.key?.fromMe ? null : remoteJid),
-    sender_name: msg.pushName || null,
+    sender_name: isLikelyHumanName(msg.pushName, { remoteJid, phoneNumber: phone }) ? msg.pushName : null,
     sent_at: sentAt,
     created_at: sentAt,
     status: normalizeStatus(msg.status),
     raw_payload: msg as any,
     message_id: messageId,
-    phone_normalized: jidToPhone(remoteJid),
+    phone_normalized: phone || null,
     direction: msg.key?.fromMe ? 'outbound' : 'inbound',
     provider: 'evolution',
   };
@@ -1097,6 +1118,7 @@ export async function getInboxContacts(): Promise<any[]> {
     const { data, error } = await admin
       .from('whatsapp_chats')
       .select('*')
+      .eq('user_id', user.id)
       .eq('instance_name', instanceName)
       .eq('is_group', false)
       .order('last_message_at', { ascending: false, nullsFirst: false })
@@ -1104,20 +1126,116 @@ export async function getInboxContacts(): Promise<any[]> {
 
     if (error || !data) return [];
     const remoteJids = data.map((chat) => chat.remote_jid).filter(Boolean);
-    const { data: contacts } = await admin
+    const { data: contacts, error: contactsError } = await admin
       .from('whatsapp_contacts')
       .select('remote_jid, display_name, push_name, verified_name, business_name, phone_number, profile_pic_url')
+      .eq('user_id', user.id)
       .eq('instance_name', instanceName)
       .in('remote_jid', remoteJids.length ? remoteJids : ['']);
+    if (contactsError) {
+      console.error('[getInboxContacts] contacts lookup failed:', contactsError.message);
+    }
     const contactByJid = new Map((contacts || []).map((contact: any) => [contact.remote_jid, contact]));
 
+    // For @lid chats: build a broader contact lookup by phone number
+    // Since @lid chats have contacts stored under @s.whatsapp.net JIDs,
+    // we need to cross-reference via phone_number
+    const lidChats = data.filter((chat: any) => chat.remote_jid?.endsWith('@lid'));
+    let contactByPhone = new Map<string, any>();
+    const phoneByLid = new Map<string, string>();
+    const profilePicByLid = new Map<string, string>();
+    
+    if (lidChats.length > 0) {
+      // Fetch push_names from messages for @lid chats (the best identity hint we have)
+      const lidJids = lidChats.map((c: any) => c.remote_jid);
+      const { data: lidMsgNames } = await admin
+        .from('whatsapp_messages')
+        .select('remote_jid, push_name, sender_name, phone_normalized, raw_payload')
+        .eq('user_id', user.id)
+        .eq('instance_name', instanceName)
+        .in('remote_jid', lidJids)
+        .eq('from_me', false)
+        .not('push_name', 'is', null)
+        .order('created_at', { ascending: false })
+        .limit(lidChats.length * 2);
+      
+      // Map LID jid -> best push_name (not a LID number)
+      const lidPushNames = new Map<string, string>();
+      for (const msg of lidMsgNames || []) {
+        const jid = msg.remote_jid;
+        if (!jid || lidPushNames.has(jid)) continue;
+        const name = msg.push_name || msg.sender_name;
+        if (isLikelyHumanName(name, { remoteJid: jid, phoneNumber: msg.phone_normalized })) {
+          lidPushNames.set(jid, name);
+        }
+        const altPhone = extractPhoneFromJid((msg as any)?.raw_payload?.key?.remoteJidAlt);
+        const normalizedPhone = String((msg as any).phone_normalized || '').replace(/\D/g, '');
+        const phone = altPhone || (
+          isValidPhoneNumber(normalizedPhone) && !normalizedPhone.includes(jid.split('@')[0])
+            ? normalizedPhone
+            : ''
+        );
+        if (phone && !phoneByLid.has(jid)) phoneByLid.set(jid, phone);
+      }
+
+      // Build phone-to-contact map for ALL contacts in this instance
+      const { data: allContacts, error: allContactsError } = await admin
+        .from('whatsapp_contacts')
+        .select('remote_jid, display_name, push_name, verified_name, business_name, phone_number, profile_pic_url')
+        .eq('user_id', user.id)
+        .eq('instance_name', instanceName)
+        .not('phone_number', 'is', null);
+      if (allContactsError) {
+        console.error('[getInboxContacts] all contacts lookup failed:', allContactsError.message);
+      }
+      
+      for (const c of allContacts || []) {
+        const phone = String(c.phone_number || '').replace(/\D/g, '');
+        if (phone && isValidPhoneNumber(phone)) contactByPhone.set(phone, c);
+      }
+
+      // Enrich @lid chats with push_name from messages
+      for (const chat of lidChats) {
+        const pushName = lidPushNames.get(chat.remote_jid);
+        const mappedPhone = phoneByLid.get(chat.remote_jid);
+        if (mappedPhone && !chat.phone_number) chat.phone_number = mappedPhone;
+        const mappedContact = mappedPhone ? contactByPhone.get(mappedPhone) : null;
+        if (mappedContact?.profile_pic_url) profilePicByLid.set(chat.remote_jid, mappedContact.profile_pic_url);
+        if (pushName && (!chat.chat_name || !isLikelyHumanName(chat.chat_name, { remoteJid: chat.remote_jid, phoneNumber: mappedPhone }))) {
+          chat.chat_name = pushName;
+          chat.push_name = pushName;
+        }
+      }
+    }
+
     return data.map((chat: any) => {
-      const contact = contactByJid.get(chat.remote_jid);
+      let contact = contactByJid.get(chat.remote_jid);
+      
+      // For @lid chats without a direct contact match, try phone-based lookup
+      if (!contact && chat.remote_jid?.endsWith('@lid')) {
+        const mappedPhone = phoneByLid.get(chat.remote_jid);
+        if (mappedPhone) contact = contactByPhone.get(mappedPhone);
+        // Try to find contact by matching push_name/chat_name
+        if (!contact) {
+          for (const [, c] of contactByPhone) {
+            if (c.display_name && chat.chat_name && c.display_name === chat.chat_name) {
+              contact = c;
+              break;
+            }
+            if (c.push_name && chat.push_name && c.push_name === chat.push_name) {
+              contact = c;
+              break;
+            }
+          }
+        }
+      }
+      
       const identity = resolveContactIdentity({ contact, chat, remoteJid: chat.remote_jid });
+      const profilePicUrl = identity.profilePicUrl || profilePicByLid.get(chat.remote_jid) || null;
       return {
         id: chat.id,
         phone: identity.formattedPhone || '',
-        phoneNumber: identity.formattedPhone || '',
+        phoneNumber: identity.phoneNumber || '',
         formattedPhone: identity.formattedPhone || '',
         remoteJid: chat.remote_jid,
         displayName: identity.displayName,
@@ -1129,7 +1247,7 @@ export async function getInboxContacts(): Promise<any[]> {
         timestamp: chat.last_message_at || chat.updated_at,
         lastMessageAt: chat.last_message_at || chat.updated_at,
         unreadCount: chat.unread_count || 0,
-        profilePicUrl: identity.profilePicUrl,
+        profilePicUrl,
         isLead: false,
         isLid: identity.isLid,
         isGroup: identity.isGroup,
@@ -1428,7 +1546,7 @@ export async function startNewConversation(
     // Normalize phone
     const digits = phone.replace(/\D/g, '');
     if (digits.length < 10) return { success: false, error: 'Número inválido. Mínimo 10 dígitos (DDD + número).' };
-    const fullNumber = digits.startsWith('55') ? digits : `55${digits}`;
+    const fullNumber = normalizeBrazilianPhoneNumber(digits);
     if (fullNumber.length < 12 || fullNumber.length > 13) {
       return { success: false, error: 'Número inválido. Verifique DDD e número.' };
     }

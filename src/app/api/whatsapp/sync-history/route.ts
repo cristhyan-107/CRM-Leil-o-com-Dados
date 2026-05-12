@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { createServerSupabase } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { extractMessageText, getEvolutionMessages } from '@/lib/evolution';
-import { extractPhoneFromJid, stableMessageId } from '@/lib/whatsapp-normalize';
+import { extractPhoneFromJid, getMessageMediaInfo, stableMessageId } from '@/lib/whatsapp-normalize';
 import { resolveWhatsAppInstance } from '@/app/(app)/settings/whatsapp/actions';
 
 export const dynamic = 'force-dynamic';
@@ -20,7 +20,12 @@ export async function POST(req: Request) {
   let chats: Array<{ id: string; remote_jid: string }> = [];
 
   if (mode === 'selectedChat' && body.chatId) {
-    const { data } = await admin.from('whatsapp_chats').select('id, remote_jid').eq('id', body.chatId).maybeSingle();
+    const { data } = await admin
+      .from('whatsapp_chats')
+      .select('id, remote_jid')
+      .eq('user_id', user.id)
+      .eq('id', body.chatId)
+      .maybeSingle();
     if (data) chats = [data];
   } else {
     const { data } = await admin
@@ -41,6 +46,7 @@ export async function POST(req: Request) {
       const rows = messages.map((msg: any) => {
         const remoteJid = msg.key?.remoteJid || chat.remote_jid;
         const content = extractMessageText(msg.message);
+        const media = getMessageMediaInfo(msg.message);
         const sentAt = msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toISOString() : new Date().toISOString();
         const messageId = msg.key?.id || stableMessageId([instanceName, remoteJid, sentAt, msg.key?.fromMe, content]);
         return {
@@ -51,9 +57,14 @@ export async function POST(req: Request) {
           message_key: messageId,
           from_me: Boolean(msg.key?.fromMe),
           push_name: msg.pushName || null,
-          message_type: msg.messageType || 'conversation',
+          message_type: msg.messageType || media.type || 'conversation',
           content,
           text: content || null,
+          caption: media.caption || null,
+          has_media: media.hasMedia,
+          media_mimetype: media.mimetype,
+          media_filename: media.filename,
+          media_url: media.url,
           status: msg.status || 'sent',
           sent_at: sentAt,
           created_at: sentAt,

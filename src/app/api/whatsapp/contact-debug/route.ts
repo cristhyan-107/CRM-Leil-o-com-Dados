@@ -59,7 +59,8 @@ export async function GET(req: Request) {
       identity.displayName.includes('@c.us') ||
       identity.displayName.includes('@g.us') ||
       identity.displayName.includes('@lid') ||
-      identity.displayName.includes('@broadcast');
+      identity.displayName.includes('@broadcast') ||
+      /^\d{10,}$/.test(identity.displayName.replace(/\D/g, ''));
     if (wouldShowRaw) rawJidWouldBeShown++;
 
     return {

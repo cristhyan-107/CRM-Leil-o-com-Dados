@@ -20,7 +20,6 @@ import { cn } from '@/lib/utils';
 import {
   getInboxContacts,
   markChatAsRead,
-  startNewConversation,
 } from '@/app/(app)/settings/whatsapp/actions';
 import { createClient } from '@/lib/supabase/client';
 
@@ -49,6 +48,16 @@ function getInitials(name: string) {
     .map((n) => n[0])
     .join('')
     .toUpperCase();
+}
+
+function getMediaKind(msg: Message) {
+  const type = (msg.message_type || '').toLowerCase();
+  const mime = (msg.media_mimetype || '').toLowerCase();
+  if (mime.startsWith('image/') || type.includes('imagemessage') || type.includes('sticker')) return 'image';
+  if (mime.startsWith('audio/') || type.includes('audiomessage')) return 'audio';
+  if (mime.startsWith('video/') || type.includes('videomessage')) return 'video';
+  if (msg.has_media) return 'file';
+  return null;
 }
 
 // ============================================================
@@ -117,6 +126,7 @@ export function ChatInterface({
   const [isOnline, setIsOnline] = useState(true);
   const [historyError, setHistoryError] = useState('');
   const [isSyncingHistory, setIsSyncingHistory] = useState(false);
+  const [brokenAvatars, setBrokenAvatars] = useState<Set<string>>(() => new Set());
 
   // Modal nova conversa
   const [showNewConv, setShowNewConv] = useState(false);
@@ -164,19 +174,19 @@ export function ChatInterface({
       // Contato não está no inbox (nova conversa ou não sincronizada)
       // Criar contato sintético — usar 'Contato WhatsApp' se for @lid
       const isLid = initialJid.includes('@lid');
-      const phonePart = isLid ? '' : initialJid.split('@')[0];
-      const displayName = isLid ? 'Contato WhatsApp' : (phonePart || 'Contato WhatsApp');
       setSelectedContact({
         id: `synthetic_${initialJid}`,
-        phone: phonePart,
+        phone: '',
         remoteJid: initialJid,
-        name: displayName,
+        name: isLid ? 'Contato WhatsApp' : 'Contato WhatsApp',
         lastMessage: '',
         timestamp: new Date().toISOString(),
         unreadCount: 0,
         profilePicUrl: null,
         isLead: false,
         isLid,
+        canSendMessage: true,
+        sendJid: initialJid,
       });
       initialJidHandled.current = true;
     }
@@ -460,7 +470,23 @@ export function ChatInterface({
     setNewConvLoading(true);
     setNewConvError('');
 
-    const result = await startNewConversation(newConvPhone.trim());
+    let result: any;
+    try {
+      const response = await fetch('/api/whatsapp/start-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phoneNumber: newConvPhone.trim() }),
+      });
+      result = await response.json();
+      if (!response.ok && result?.error) {
+        result = { success: false, error: result.error };
+      }
+    } catch (error) {
+      result = {
+        success: false,
+        error: error instanceof Error ? error.message : 'Erro ao iniciar conversa',
+      };
+    }
 
     if (result.success && result.remoteJid) {
       // Use backend-returned data — never parse JID in frontend
@@ -635,15 +661,13 @@ export function ChatInterface({
                   >
                     {/* Avatar */}
                     <div className="relative flex-shrink-0">
-                      {contact.profilePicUrl ? (
+                      {contact.profilePicUrl && !brokenAvatars.has(contact.remoteJid) ? (
                         // eslint-disable-next-line @next/next/no-img-element
                         <img
                           src={contact.profilePicUrl}
                           alt={contact.name}
                           className="w-11 h-11 rounded-full object-cover border border-white/[0.08]"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).style.display = 'none';
-                          }}
+                          onError={() => setBrokenAvatars((prev) => new Set(prev).add(contact.remoteJid))}
                         />
                       ) : (
                         <div className="w-11 h-11 rounded-full bg-gradient-to-br from-blue-900/40 to-gray-800 flex items-center justify-center border border-white/[0.08] text-sm font-semibold text-blue-300">
@@ -672,6 +696,9 @@ export function ChatInterface({
                           {formatDate(contact.timestamp)}
                         </span>
                       </div>
+                      {contact.formattedPhone && contact.formattedPhone !== contact.name && (
+                        <p className="text-[11px] text-gray-500 truncate">{contact.formattedPhone}</p>
+                      )}
                       <p
                         className={cn(
                           'text-xs truncate',
@@ -717,13 +744,13 @@ export function ChatInterface({
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
-                {selectedContact.profilePicUrl ? (
+                {selectedContact.profilePicUrl && !brokenAvatars.has(selectedContact.remoteJid) ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
                     src={selectedContact.profilePicUrl}
                     alt={selectedContact.name}
                     className="w-9 h-9 rounded-full object-cover border border-white/[0.08]"
-                    onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                    onError={() => setBrokenAvatars((prev) => new Set(prev).add(selectedContact.remoteJid))}
                   />
                 ) : (
                   <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-900/40 to-gray-800 flex items-center justify-center border border-white/[0.08] text-xs font-semibold text-blue-300">
@@ -788,6 +815,10 @@ export function ChatInterface({
                       !prevMsg ||
                       new Date(msg.created_at).toDateString() !==
                         new Date(prevMsg.created_at).toDateString();
+                    const mediaKind = getMediaKind(msg);
+                    const mediaSrc = msg.message_id
+                      ? (msg.media_url || `/api/whatsapp/messages/${encodeURIComponent(msg.message_id)}/media`)
+                      : msg.media_url || '';
 
                     return (
                       <div key={msg.id || idx}>
@@ -818,20 +849,22 @@ export function ChatInterface({
                                 : 'bg-[#161c28] border border-white/[0.04] text-gray-100 rounded-2xl rounded-bl-sm'
                             )}
                           >
-                            {msg.has_media && msg.media_mimetype?.startsWith('image/') ? (
+                            {mediaKind === 'image' && mediaSrc ? (
                               <div className="mb-2 overflow-hidden rounded-xl border border-white/10">
                                 {/* eslint-disable-next-line @next/next/no-img-element */}
                                 <img
-                                  src={msg.media_url || `/api/whatsapp/messages/${msg.message_id}/media`}
+                                  src={mediaSrc}
                                   alt={msg.media_filename || 'Imagem'}
                                   className="max-h-72 w-full object-cover"
                                 />
                               </div>
-                            ) : msg.has_media && msg.media_mimetype?.startsWith('audio/') ? (
-                              <audio controls src={msg.media_url || `/api/whatsapp/messages/${msg.message_id}/media`} className="mb-2 max-w-full" />
-                            ) : msg.has_media ? (
+                            ) : mediaKind === 'audio' && mediaSrc ? (
+                              <audio controls src={mediaSrc} className="mb-2 max-w-full" />
+                            ) : mediaKind === 'video' && mediaSrc ? (
+                              <video controls src={mediaSrc} className="mb-2 max-h-72 max-w-full rounded-xl border border-white/10" />
+                            ) : mediaKind === 'file' && mediaSrc ? (
                               <a
-                                href={msg.media_url || `/api/whatsapp/messages/${msg.message_id}/media`}
+                                href={mediaSrc}
                                 target="_blank"
                                 rel="noreferrer"
                                 className="mb-2 block rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-blue-100 hover:bg-black/30"

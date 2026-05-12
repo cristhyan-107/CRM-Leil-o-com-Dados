@@ -1,14 +1,12 @@
 import { NextResponse } from 'next/server';
 import { createServerSupabase } from '@/lib/supabase/server';
-import { getEvolutionWebhook } from '@/lib/evolution';
+import { getEvolutionWebhook, getEvolutionWebhookUrl } from '@/lib/evolution';
 import { resolveWhatsAppInstance } from '@/app/(app)/settings/whatsapp/actions';
 
 export const dynamic = 'force-dynamic';
 
 function expectedWebhookUrl() {
-  const base = process.env.NEXT_PUBLIC_URL || 'https://crm-imob.leilaocomdados.com.br';
-  const secret = process.env.EVOLUTION_WEBHOOK_SECRET;
-  return `${base}/api/webhooks/evolution${secret ? `?secret=${encodeURIComponent(secret)}` : ''}`;
+  return getEvolutionWebhookUrl();
 }
 
 function maskSecret(url: string) {

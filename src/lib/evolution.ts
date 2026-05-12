@@ -11,6 +11,22 @@ function buildUrl(path: string) {
   return `${cleanBase}/${cleanPath}`;
 }
 
+export function getEvolutionWebhookUrl() {
+  const explicit = process.env.EVOLUTION_WEBHOOK_URL;
+  const base =
+    process.env.EVOLUTION_WEBHOOK_BASE_URL ||
+    process.env.NEXT_PUBLIC_URL ||
+    (process.env.VERCEL_PROJECT_PRODUCTION_URL
+      ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+      : 'https://crm.leilaocomdados.com.br');
+  const cleanBase = (explicit || base).replace(/\/+$/, '');
+  const secret = process.env.EVOLUTION_WEBHOOK_SECRET;
+  const url = cleanBase.endsWith('/api/webhooks/evolution')
+    ? cleanBase
+    : `${cleanBase}/api/webhooks/evolution`;
+  return `${url}${secret ? `?secret=${encodeURIComponent(secret)}` : ''}`;
+}
+
 export class EvolutionApiError extends Error {
   status: number;
   url: string;
@@ -94,7 +110,7 @@ export async function evolutionFetch(endpoint: string, options?: RequestInit) {
 // ============================================================
 
 export async function createEvolutionInstance(instanceName: string) {
-  const appUrl = process.env.NEXT_PUBLIC_URL || 'https://crm-imob.leilaocomdados.com.br';
+  const webhookUrl = getEvolutionWebhookUrl();
 
   const response = await evolutionFetch('/instance/create', {
     method: 'POST',
@@ -103,7 +119,7 @@ export async function createEvolutionInstance(instanceName: string) {
       qrcode: true,
       integration: 'WHATSAPP-BAILEYS',
       webhook: {
-        url: `${appUrl}/api/webhooks/evolution`,
+        url: webhookUrl,
         byEvents: false,
         base64: false,
         events: [
@@ -215,10 +231,7 @@ export async function getEvolutionQRCode(instanceName: string): Promise<any> {
 // ============================================================
 
 export async function updateEvolutionWebhook(instanceName: string) {
-  const appUrl = process.env.NEXT_PUBLIC_URL || 'https://crm-imob.leilaocomdados.com.br';
-  const secret = process.env.EVOLUTION_WEBHOOK_SECRET;
-  const webhookUrl =
-    `${appUrl}/api/webhooks/evolution${secret ? `?secret=${encodeURIComponent(secret)}` : ''}`;
+  const webhookUrl = getEvolutionWebhookUrl();
 
   return evolutionFetch(`/webhook/set/${instanceName}`, {
     method: 'POST',
@@ -378,6 +391,7 @@ export interface EvolutionContact {
   displayName?: string;
   pushName?: string;
   verifiedName?: string;
+  businessName?: string;
   profilePicUrl?: string;
   isBusiness?: boolean;
   isGroup?: boolean;
@@ -413,6 +427,7 @@ export function normalizeContactPayload(payload: any): EvolutionContact[] {
         displayName: contact?.name || contact?.displayName,
         pushName: contact?.pushName,
         verifiedName: contact?.verifiedName,
+        businessName: contact?.businessName || contact?.business_name,
         profilePicUrl: contact?.profilePicUrl || contact?.profilePictureUrl,
         isBusiness: Boolean(contact?.isBusiness),
         isGroup: normalizedJid.endsWith('@g.us'),
@@ -470,12 +485,12 @@ export async function getEvolutionMessages(
 
 export async function sendEvolutionMessage(
   instanceName: string,
-  number: string,
+  numberOrJid: string,
   text: string,
   options?: { remoteJid?: string }
 ) {
   // For @lid contacts or when phone is unavailable, try sending via remoteJid
-  const sendNumber = number || options?.remoteJid || '';
+  const sendNumber = numberOrJid || options?.remoteJid || '';
   if (!sendNumber) {
     throw new Error('Nenhum número ou remoteJid disponível para envio.');
   }
@@ -519,9 +534,16 @@ export function extractMessageText(message?: EvolutionMessage['message']): strin
   return '';
 }
 
-/** Normaliza JID → número de telefone limpo */
+/** Normaliza JID → número de telefone limpo.
+ *  Retorna '' para @lid, @g.us e @broadcast — esses NÃO são telefones.
+ */
 export function jidToPhone(jid: string): string {
-  return jid.split('@')[0].split(':')[0];
+  if (!jid) return '';
+  const lower = jid.toLowerCase();
+  if (lower.includes('@lid') || lower.includes('@g.us') || lower.includes('@broadcast')) {
+    return '';
+  }
+  return jid.split('@')[0].split(':')[0].replace(/\D/g, '');
 }
 
 /**

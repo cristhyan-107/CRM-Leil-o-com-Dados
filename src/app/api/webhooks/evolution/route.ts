@@ -249,7 +249,9 @@ async function saveEvolutionMessage(
     message?.key?.id ||
     stableMessageId([instanceName, remoteJid, timestamp, fromMe, messageType, text, media.mimetype]);
   const phone = extractPhoneFromJid(message?.key?.remoteJidAlt || remoteJid);
-  const senderName = message?.pushName || message?.senderName || null;
+  const rawSenderName = message?.pushName || message?.senderName || null;
+  // Filter out LID numbers that Evolution sometimes sends as pushName
+  const senderName = (rawSenderName && /^\d{10,}$/.test(rawSenderName)) ? null : rawSenderName;
 
   const userId = await resolveUserIdForInstance(supabase, instanceName);
   if (!userId) {
@@ -391,6 +393,7 @@ async function processContactEvents(supabase: any, payload: any): Promise<Webhoo
         display_name: displayName,
         push_name: contact?.pushName || null,
         verified_name: contact?.verifiedName || null,
+        business_name: contact?.businessName || contact?.business_name || null,
         profile_pic_url: contact?.profilePicUrl || contact?.profilePictureUrl || null,
         is_business: Boolean(contact?.isBusiness),
         is_group: isGroupJid(remoteJid),

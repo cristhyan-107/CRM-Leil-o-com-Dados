@@ -28,20 +28,26 @@ export function normalizeEvolutionEventName(event: unknown) {
 export function normalizeWhatsAppJid(jid: unknown) {
   const value = String(jid || '').trim();
   if (!value) return '';
-  return value.includes('@') ? value : `${value.replace(/\D/g, '')}@s.whatsapp.net`;
+  if (value.includes('@')) return value;
+  const digits = value.replace(/\D/g, '');
+  return digits ? `${digits}@s.whatsapp.net` : '';
 }
 
-export function isLidJid(jid: string) {
+export function isLidJid(jid: unknown) {
   return normalizeWhatsAppJid(jid).endsWith('@lid');
 }
 
-export function isGroupJid(jid: string) {
+export function isGroupJid(jid: unknown) {
   return normalizeWhatsAppJid(jid).endsWith('@g.us');
 }
 
-export function isBroadcastJid(jid: string) {
+export function isBroadcastJid(jid: unknown) {
   const normalized = normalizeWhatsAppJid(jid);
   return normalized.includes('@broadcast') || normalized === 'status@broadcast';
+}
+
+export function extractJidIdentifier(jid: unknown) {
+  return normalizeWhatsAppJid(jid).split('@')[0].split(':')[0];
 }
 
 export function extractPhoneFromJid(jid: unknown) {
@@ -49,7 +55,37 @@ export function extractPhoneFromJid(jid: unknown) {
   if (!normalized || isLidJid(normalized) || isBroadcastJid(normalized) || isGroupJid(normalized)) {
     return '';
   }
-  return normalized.split('@')[0].split(':')[0].replace(/\D/g, '');
+  const digits = extractJidIdentifier(normalized).replace(/\D/g, '');
+  return isValidPhoneNumber(digits) ? digits : '';
+}
+
+export function normalizeBrazilianPhoneNumber(phone: unknown) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (!digits) return '';
+  const withoutLeadingZeros = digits.replace(/^0+/, '');
+  const normalized = withoutLeadingZeros.startsWith('55')
+    ? withoutLeadingZeros
+    : withoutLeadingZeros.length >= 10
+      ? `55${withoutLeadingZeros}`
+      : withoutLeadingZeros;
+  return normalized;
+}
+
+export function isValidPhoneNumber(phone: unknown) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (!digits) return false;
+  if (digits.length < 10 || digits.length > 15) return false;
+  if (/^0+$/.test(digits)) return false;
+  return true;
+}
+
+export function isLikelyLidNumber(value: unknown, remoteJid?: unknown) {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (!digits) return false;
+  const jid = normalizeWhatsAppJid(remoteJid);
+  if (jid.endsWith('@lid') && digits === extractJidIdentifier(jid)) return true;
+  if (digits.length >= 14 && !digits.startsWith('55')) return true;
+  return false;
 }
 
 export function formatBrazilianPhone(phone: unknown) {
@@ -63,6 +99,33 @@ export function formatBrazilianPhone(phone: unknown) {
     return `+55 ${normalized.slice(2, 4)} ${normalized.slice(4, 8)}-${normalized.slice(8)}`;
   }
   return digits;
+}
+
+function hasJidMarker(value: string) {
+  return (
+    value.includes('@s.whatsapp.net') ||
+    value.includes('@c.us') ||
+    value.includes('@g.us') ||
+    value.includes('@lid') ||
+    value.includes('@broadcast')
+  );
+}
+
+export function isLikelyHumanName(value: unknown, context?: { remoteJid?: unknown; phoneNumber?: unknown }) {
+  const name = String(value || '').trim();
+  if (!name) return false;
+  const rawJid = normalizeWhatsAppJid(context?.remoteJid);
+  if (name === rawJid || hasJidMarker(name) || /^\d+@/.test(name)) return false;
+
+  const digits = name.replace(/\D/g, '');
+  const phoneDigits = String(context?.phoneNumber || '').replace(/\D/g, '');
+  if (digits && digits === extractJidIdentifier(rawJid)) return false;
+  if (digits && phoneDigits && digits === phoneDigits) return false;
+  if (/^\+?\d[\d\s().-]{7,}$/.test(name)) return false;
+  if (/^\d{10,}$/.test(name)) return false;
+  if (isLikelyLidNumber(name, rawJid)) return false;
+
+  return true;
 }
 
 export function extractMessageTextFromPayload(message: any) {
@@ -79,17 +142,41 @@ export function extractMessageTextFromPayload(message: any) {
 }
 
 export function getMessageMediaInfo(message: any) {
+  const type =
+    message?.imageMessage ? 'imageMessage' :
+    message?.videoMessage ? 'videoMessage' :
+    message?.audioMessage ? 'audioMessage' :
+    message?.documentMessage ? 'documentMessage' :
+    message?.stickerMessage ? 'stickerMessage' :
+    null;
+
   const media =
     message?.imageMessage ||
     message?.videoMessage ||
     message?.audioMessage ||
     message?.documentMessage ||
-    message?.stickerMessage;
+    message?.stickerMessage ||
+    null;
+
+  const fallbackMimetype: Record<string, string> = {
+    imageMessage: 'image/jpeg',
+    videoMessage: 'video/mp4',
+    audioMessage: 'audio/ogg',
+    documentMessage: 'application/octet-stream',
+    stickerMessage: 'image/webp',
+  };
 
   return {
+    type,
     hasMedia: Boolean(media),
-    mimetype: media?.mimetype || null,
-    filename: media?.fileName || media?.title || null,
+    mimetype: media?.mimetype || (type ? fallbackMimetype[type] : null),
+    filename:
+      media?.fileName ||
+      media?.filename ||
+      media?.title ||
+      (type === 'imageMessage' ? 'imagem.jpg' : null),
+    url: media?.url || null,
+    caption: media?.caption || null,
   };
 }
 
@@ -113,47 +200,7 @@ export function resolveContactDisplayName({
   message?: any;
   remoteJid?: string;
 }) {
-  const phone = contact?.phone_number || chat?.phone_number || extractPhoneFromJid(remoteJid);
-  const candidates = [
-    contact?.display_name,
-    contact?.verified_name,
-    contact?.business_name,
-    contact?.push_name,
-    chat?.chat_name,
-    chat?.name,
-    chat?.push_name,
-    message?.sender_name,
-    message?.pushName,
-  ];
-
-  const rawJid = normalizeWhatsAppJid(remoteJid || chat?.remote_jid || contact?.remote_jid);
-  const isLid = isLidJid(rawJid);
-
-  for (const candidate of candidates) {
-    const value = String(candidate || '').trim();
-    // Never return raw JIDs or @lid identifiers
-    if (
-      value &&
-      value !== rawJid &&
-      !value.endsWith('@lid') &&
-      !value.endsWith('@s.whatsapp.net') &&
-      !value.endsWith('@g.us') &&
-      !value.includes('@broadcast')
-    ) {
-      return value;
-    }
-  }
-
-  // If we have a real phone number, format it nicely
-  if (phone) return formatBrazilianPhone(phone);
-
-  // For @lid without any name or phone, use a friendly label
-  if (isLid) return 'Contato WhatsApp';
-
-  // For normal JIDs without name, extract the number part
-  if (rawJid && !isLidJid(rawJid)) return rawJid.split('@')[0];
-
-  return 'Contato sem nome';
+  return resolveContactIdentity({ contact, chat, message, remoteJid }).displayName;
 }
 
 export function resolveProfilePicture({ contact, chat }: { contact?: any; chat?: any }) {
@@ -170,12 +217,6 @@ export function avatarFallback(name: string) {
     .toUpperCase() || '?';
 }
 
-// ============================================================
-// Central Identity Resolver
-// Returns ALL UI-ready fields for a WhatsApp contact/chat.
-// The frontend MUST use this and NEVER parse JIDs directly.
-// ============================================================
-
 export interface WhatsAppIdentity {
   displayName: string;
   displayNameSource: string;
@@ -186,7 +227,93 @@ export interface WhatsAppIdentity {
   isGroup: boolean;
   canSendMessage: boolean;
   sendJid: string | null;
+  sendStrategy: 'phone_jid' | 'remote_jid' | 'lid_direct' | 'group_jid' | 'failed';
   avatarFallback: string;
+}
+
+function resolvePhoneNumber(contact: any, chat: any, rawJid: string) {
+  const candidates = [
+    contact?.phone_number,
+    contact?.phoneNumber,
+    chat?.phone_number,
+    chat?.phoneNumber,
+    extractPhoneFromJid(contact?.remote_jid),
+    extractPhoneFromJid(chat?.remote_jid),
+    extractPhoneFromJid(rawJid),
+  ];
+
+  for (const candidate of candidates) {
+    const digits = String(candidate || '').replace(/\D/g, '');
+    if (!digits) continue;
+    if (isLikelyLidNumber(digits, rawJid)) continue;
+    if (isValidPhoneNumber(digits)) return digits;
+  }
+
+  return '';
+}
+
+export function resolveSendJid({
+  remoteJid,
+  phoneNumber,
+  allowLidDirect = true,
+}: {
+  remoteJid?: unknown;
+  phoneNumber?: unknown;
+  allowLidDirect?: boolean;
+}) {
+  const rawJid = normalizeWhatsAppJid(remoteJid);
+  const phone = String(phoneNumber || '').replace(/\D/g, '');
+  const validPhone = isValidPhoneNumber(phone) && !isLikelyLidNumber(phone, rawJid) ? phone : '';
+
+  if (validPhone) {
+    return {
+      canSendMessage: true,
+      sendJid: `${validPhone}@s.whatsapp.net`,
+      sendTarget: validPhone,
+      sendStrategy: 'phone_jid' as const,
+      reason: null,
+    };
+  }
+
+  if (rawJid.endsWith('@s.whatsapp.net') || rawJid.endsWith('@c.us')) {
+    return {
+      canSendMessage: true,
+      sendJid: rawJid,
+      sendTarget: rawJid,
+      sendStrategy: 'remote_jid' as const,
+      reason: null,
+    };
+  }
+
+  if (allowLidDirect && rawJid.endsWith('@lid')) {
+    return {
+      canSendMessage: true,
+      sendJid: rawJid,
+      sendTarget: rawJid,
+      sendStrategy: 'lid_direct' as const,
+      reason: 'Contato sem telefone real; envio tentara o identificador @lid.',
+    };
+  }
+
+  if (rawJid.endsWith('@g.us')) {
+    return {
+      canSendMessage: true,
+      sendJid: rawJid,
+      sendTarget: rawJid,
+      sendStrategy: 'group_jid' as const,
+      reason: null,
+    };
+  }
+
+  return {
+    canSendMessage: false,
+    sendJid: null,
+    sendTarget: null,
+    sendStrategy: 'failed' as const,
+    reason: rawJid.endsWith('@lid')
+      ? 'Contato @lid sem telefone real associado.'
+      : 'Nao foi possivel resolver destinatario de envio.',
+  };
 }
 
 export function resolveContactIdentity({
@@ -205,53 +332,30 @@ export function resolveContactIdentity({
   const isGroup = isGroupJid(rawJid);
   const isBroadcast = isBroadcastJid(rawJid);
 
-  // --- Phone Resolution ---
-  // Priority: contact.phone_number > chat.phone_number > extract from JID
-  // NEVER extract phone from @lid, @g.us, or @broadcast
-  const rawPhone =
-    contact?.phone_number ||
-    chat?.phone_number ||
-    extractPhoneFromJid(rawJid);
-  const phoneNumber = rawPhone || null;
+  const phoneNumber = resolvePhoneNumber(contact, chat, rawJid);
   const formattedPhone = phoneNumber ? formatBrazilianPhone(phoneNumber) : null;
 
-  // --- Name Resolution ---
-  // Priority order per spec; never return JID/lid identifiers
   const nameCandidates = [
-    contact?.display_name,
-    contact?.verified_name,
-    contact?.business_name,
-    contact?.push_name,
-    chat?.chat_name,
-    chat?.name,
-    chat?.push_name,
-    message?.sender_name,
-    message?.pushName,
+    { value: contact?.display_name, source: 'display_name' },
+    { value: contact?.verified_name, source: 'verified_name' },
+    { value: contact?.business_name, source: 'business_name' },
+    { value: contact?.push_name, source: 'push_name' },
+    { value: chat?.chat_name, source: 'chat_name' },
+    { value: chat?.name, source: 'chat_name' },
+    { value: chat?.push_name, source: 'push_name' },
+    { value: message?.sender_name, source: 'sender_name' },
+    { value: message?.pushName, source: 'push_name' },
+    { value: message?.push_name, source: 'push_name' },
   ];
 
   let displayName = '';
   let displayNameSource = '';
 
-  const sourceMap = [
-    'display_name', 'verified_name', 'business_name', 'push_name',
-    'chat_name', 'chat_name', 'push_name', 'sender_name', 'push_name',
-  ];
-
-  for (let i = 0; i < nameCandidates.length; i++) {
-    const value = String(nameCandidates[i] || '').trim();
-    if (
-      value &&
-      value !== rawJid &&
-      !value.endsWith('@lid') &&
-      !value.endsWith('@s.whatsapp.net') &&
-      !value.endsWith('@c.us') &&
-      !value.endsWith('@g.us') &&
-      !value.includes('@broadcast') &&
-      // Reject values that look like raw JIDs (numeric@domain)
-      !/^\d+@/.test(value)
-    ) {
+  for (const candidate of nameCandidates) {
+    const value = String(candidate.value || '').trim();
+    if (isLikelyHumanName(value, { remoteJid: rawJid, phoneNumber })) {
       displayName = value;
-      displayNameSource = sourceMap[i];
+      displayNameSource = candidate.source;
       break;
     }
   }
@@ -266,51 +370,30 @@ export function resolveContactIdentity({
     } else if (isLid) {
       displayName = 'Contato WhatsApp';
       displayNameSource = 'fallback';
-    } else if (rawJid && !isLid && !isGroup && !isBroadcast) {
-      // Normal JID without name — extract phone part and format
-      const jidPhone = rawJid.split('@')[0];
-      displayName = formatBrazilianPhone(jidPhone) || jidPhone;
-      displayNameSource = 'jid_phone';
+    } else if (rawJid && !isBroadcast) {
+      const phone = extractPhoneFromJid(rawJid);
+      displayName = phone ? formatBrazilianPhone(phone) : 'Contato WhatsApp';
+      displayNameSource = phone ? 'jid_phone' : 'fallback';
     } else {
-      displayName = 'Contato sem nome';
+      displayName = 'Contato WhatsApp';
       displayNameSource = 'fallback';
     }
   }
 
-  // --- Profile Picture ---
-  const profilePicUrl =
-    contact?.profile_pic_url || chat?.profile_pic_url || null;
-
-  // --- Send JID Resolution ---
-  // Priority: phone-based JID > raw remoteJid if @s.whatsapp.net or @c.us > @lid (risky)
-  let sendJid: string | null = null;
-  let canSendMessage = false;
-
-  if (phoneNumber) {
-    sendJid = `${phoneNumber}@s.whatsapp.net`;
-    canSendMessage = true;
-  } else if (rawJid && (rawJid.endsWith('@s.whatsapp.net') || rawJid.endsWith('@c.us'))) {
-    sendJid = rawJid;
-    canSendMessage = true;
-  } else if (isLid) {
-    // Allow sending via LID — Evolution v2 supports it
-    sendJid = rawJid;
-    canSendMessage = true;
-  } else if (isGroup) {
-    sendJid = rawJid;
-    canSendMessage = true;
-  }
+  const profilePicUrl = contact?.profile_pic_url || chat?.profile_pic_url || null;
+  const send = resolveSendJid({ remoteJid: rawJid, phoneNumber });
 
   return {
     displayName,
     displayNameSource,
-    phoneNumber,
+    phoneNumber: phoneNumber || null,
     formattedPhone,
     profilePicUrl,
     isLid,
     isGroup,
-    canSendMessage,
-    sendJid,
+    canSendMessage: send.canSendMessage,
+    sendJid: send.sendJid,
+    sendStrategy: send.sendStrategy,
     avatarFallback: avatarFallback(displayName),
   };
 }

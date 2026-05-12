@@ -3,6 +3,7 @@ import { createServerSupabase } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { getBase64FromMediaMessage } from '@/lib/evolution';
 import { resolveWhatsAppInstance } from '@/app/(app)/settings/whatsapp/actions';
+import { getMessageMediaInfo } from '@/lib/whatsapp-normalize';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,6 +17,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ messageId: str
   const { data: message, error } = await admin
     .from('whatsapp_messages')
     .select('instance_name, remote_jid, message_id, message_key, from_me, media_url, media_mimetype, raw_payload')
+    .eq('user_id', user.id)
     .eq('message_id', messageId)
     .maybeSingle();
 
@@ -33,10 +35,12 @@ export async function GET(_req: Request, ctx: { params: Promise<{ messageId: str
   try {
     const result = await getBase64FromMediaMessage(instanceName, messageKey);
     const base64 = result?.base64 || result?.data?.base64 || result?.media;
+    const rawMedia = getMessageMediaInfo(message.raw_payload?.message);
     const mimetype =
       result?.mimetype ||
       result?.data?.mimetype ||
       message.media_mimetype ||
+      rawMedia.mimetype ||
       message.raw_payload?.message?.imageMessage?.mimetype ||
       message.raw_payload?.message?.videoMessage?.mimetype ||
       message.raw_payload?.message?.audioMessage?.mimetype ||

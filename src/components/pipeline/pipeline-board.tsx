@@ -23,7 +23,9 @@ type Lead = {
 type Conversation = {
   id: string;
   remote_jid: string;
+  chat_name?: string | null;
   push_name: string | null;
+  phone_number?: string | null;
   last_message: string | null;
   last_message_at: string | null;
   pipeline_stage: string;
@@ -52,7 +54,26 @@ const COLUMNS = [
 // ─── Helper ────────────────────────────────────────────────────────────────────
 
 function jidToPhone(jid: string): string {
-  return jid.split('@')[0].split(':')[0];
+  if (!jid) return '';
+  const lower = jid.toLowerCase();
+  if (lower.includes('@lid') || lower.includes('@g.us') || lower.includes('@broadcast')) {
+    return '';
+  }
+  return jid.split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+
+function formatPhone(phone: string) {
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length === 13 && digits.startsWith('55')) return `+55 ${digits.slice(2, 4)} ${digits.slice(4, 9)}-${digits.slice(9)}`;
+  if (digits.length === 12 && digits.startsWith('55')) return `+55 ${digits.slice(2, 4)} ${digits.slice(4, 8)}-${digits.slice(8)}`;
+  return digits;
+}
+
+function isGoodName(value: string | null | undefined, remoteJid: string) {
+  const name = String(value || '').trim();
+  if (!name || name.includes('@') || name === remoteJid) return false;
+  if (/^\d{10,}$/.test(name.replace(/\D/g, ''))) return false;
+  return true;
 }
 
 function formatRelativeTime(iso: string | null): string {
@@ -361,8 +382,13 @@ function ConversationCard({
   onDragStart: (e: React.DragEvent, id: string) => void;
 }) {
   const router = useRouter();
-  const phone = jidToPhone(conv.remote_jid);
-  const name = conv.push_name || phone;
+  const rawPhone = conv.phone_number || jidToPhone(conv.remote_jid);
+  const phone = rawPhone ? formatPhone(rawPhone) : '';
+  const name = isGoodName(conv.chat_name, conv.remote_jid)
+    ? conv.chat_name!
+    : isGoodName(conv.push_name, conv.remote_jid)
+      ? conv.push_name!
+      : phone || 'Contato WhatsApp';
   const initials = name.slice(0, 2).toUpperCase();
 
   return (
@@ -395,7 +421,7 @@ function ConversationCard({
               {formatRelativeTime(conv.last_message_at)}
             </span>
           </div>
-          <p className="text-xs text-gray-500">{phone}</p>
+          {phone && <p className="text-xs text-gray-500">{phone}</p>}
         </div>
       </div>
 

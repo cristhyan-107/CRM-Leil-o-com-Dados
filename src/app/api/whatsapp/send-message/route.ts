@@ -6,21 +6,120 @@ import {
   extractPhoneFromJid,
   isLidJid,
   normalizeWhatsAppJid,
+  resolveContactIdentity,
+  resolveSendJid,
   stableMessageId,
 } from '@/lib/whatsapp-normalize';
 import { resolveWhatsAppInstance } from '@/app/(app)/settings/whatsapp/actions';
 
 export const dynamic = 'force-dynamic';
 
-function friendlySendError(error: unknown) {
+function safeJson(value: string) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function friendlySendError(error: unknown, sendReason?: string | null) {
   if (error instanceof EvolutionApiError) {
-    if (error.status === 401 || error.status === 403) return 'API key da Evolution inválida.';
-    if (error.status === 404) return 'Instância não encontrada ou endpoint de envio incorreto.';
+    if (error.status === 401 || error.status === 403) return 'API key da Evolution invalida.';
+    if (error.status === 404) return 'Instancia nao encontrada ou endpoint de envio incorreto.';
+    if (error.status === 400 && sendReason) return sendReason;
     return `Evolution retornou erro HTTP ${error.status}.`;
   }
-  const message = error instanceof Error ? error.message : String(error);
-  if (message.toLowerCase().includes('remotejid')) return 'remoteJid inválido.';
+  const message = error instanceof Error ? error.message : String(error || '');
   return message || 'Erro ao enviar mensagem.';
+}
+
+async function findChat(admin: ReturnType<typeof createAdminClient>, userId: string, chatId?: string, remoteJid?: string) {
+  if (chatId && !chatId.startsWith('synthetic_') && !chatId.startsWith('new_')) {
+    const { data, error } = await admin
+      .from('whatsapp_chats')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('id', chatId)
+      .maybeSingle();
+    if (error) throw error;
+    if (data) return data;
+  }
+
+  if (remoteJid) {
+    const { data, error } = await admin
+      .from('whatsapp_chats')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('remote_jid', remoteJid)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    if (data) return data;
+  }
+
+  return null;
+}
+
+async function findContact(
+  admin: ReturnType<typeof createAdminClient>,
+  userId: string,
+  instanceName: string,
+  remoteJid: string,
+  phone?: string | null
+) {
+  const { data: direct, error } = await admin
+    .from('whatsapp_contacts')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('instance_name', instanceName)
+    .eq('remote_jid', remoteJid)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (direct) return direct;
+
+  if (phone) {
+    const { data: byPhone, error: phoneError } = await admin
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('instance_name', instanceName)
+      .eq('phone_number', phone)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (phoneError) throw phoneError;
+    if (byPhone) return byPhone;
+  }
+
+  return null;
+}
+
+async function findAltPhone(
+  admin: ReturnType<typeof createAdminClient>,
+  userId: string,
+  instanceName: string,
+  remoteJid: string
+) {
+  const { data, error } = await admin
+    .from('whatsapp_messages')
+    .select('raw_payload, phone_normalized')
+    .eq('user_id', userId)
+    .eq('instance_name', instanceName)
+    .eq('remote_jid', remoteJid)
+    .not('raw_payload', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(50);
+  if (error) throw error;
+
+  for (const row of data || []) {
+    const alt = extractPhoneFromJid((row as any)?.raw_payload?.key?.remoteJidAlt);
+    if (alt) return alt;
+  }
+
+  return null;
 }
 
 export async function POST(req: Request) {
@@ -29,96 +128,84 @@ export async function POST(req: Request) {
   if (!user) return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 });
 
   const body = await req.json().catch(() => ({}));
-  const remoteJid = normalizeWhatsAppJid(body.remoteJid);
+  const chatId = String(body.chatId || '');
+  const remoteJidInput = normalizeWhatsAppJid(body.remoteJid);
   const text = String(body.text || '').trim();
-  if (!remoteJid) return NextResponse.json({ success: false, error: 'remoteJid inválido' }, { status: 400 });
-  if (!text) return NextResponse.json({ success: false, error: 'Mensagem vazia' }, { status: 400 });
+  if (!remoteJidInput && !chatId) {
+    return NextResponse.json({ success: false, stage: 'frontendPayload', error: 'chatId ou remoteJid obrigatorio.' }, { status: 400 });
+  }
+  if (!text) return NextResponse.json({ success: false, stage: 'frontendPayload', error: 'Mensagem vazia.' }, { status: 400 });
 
   const admin = createAdminClient();
-  const { data: chat } = await admin
-    .from('whatsapp_chats')
-    .select('id, user_id, instance_name, remote_jid, phone_number')
-    .eq('remote_jid', remoteJid)
-    .order('updated_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const instanceName = chat?.instance_name || (await resolveWhatsAppInstance(remoteJid)).resolvedInstanceName;
-
-  // Resolve phone from multiple sources
-  const { data: contact } = await admin
-    .from('whatsapp_contacts')
-    .select('phone_number')
-    .eq('instance_name', instanceName)
-    .eq('remote_jid', remoteJid)
-    .order('updated_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  // Check raw_payload for alternative JID (rare but exists)
-  const { data: altMessage } = await admin
-    .from('whatsapp_messages')
-    .select('raw_payload')
-    .eq('instance_name', instanceName)
-    .eq('remote_jid', remoteJid)
-    .not('raw_payload', 'is', null)
-    .order('created_at', { ascending: false })
-    .limit(20);
-
-  const altJid = (altMessage || [])
-    .map((row: any) => row?.raw_payload?.key?.remoteJidAlt)
-    .find(Boolean) || '';
-  const phone = contact?.phone_number || chat?.phone_number || extractPhoneFromJid(altJid) || extractPhoneFromJid(remoteJid);
-
-  const isLid = isLidJid(remoteJid);
-  const diagnostics = {
-    endpoint: getEvolutionUrl(`/message/sendText/${instanceName}`),
-    instanceName,
-    remoteJid,
-    chatId: chat?.id || null,
-    resolvedSendJid: phone ? null : remoteJid,
-    phoneNumber: phone || null,
-    isLid,
-    phoneResolved: Boolean(phone),
-    sendStrategy: phone ? 'phone' : 'remoteJid',
-  };
-
-  // For normal (non-lid) contacts without phone: fail with clear error
-  if (!phone && !isLid) {
-    return NextResponse.json(
-      {
-        success: false,
-        stage: 'resolvePhone',
-        ...diagnostics,
-        evolutionEndpoint: diagnostics.endpoint,
-        evolutionStatusCode: null,
-        evolutionResponse: null,
-        databaseError: null,
-        error: 'Não foi possível identificar telefone real para este contato.',
-      },
-      { status: 400 }
-    );
-  }
+  let chat: any = null;
+  let contact: any = null;
+  let instanceName = '';
+  let remoteJid = remoteJidInput;
+  let phone: string | null = null;
 
   try {
-    console.log('[whatsapp-send] sending', diagnostics);
-    // Send via phone number when available, otherwise via remoteJid (for @lid)
-    const response = await sendEvolutionMessage(instanceName, phone || '', text, {
-      remoteJid: phone ? undefined : remoteJid,
+    chat = await findChat(admin, user.id, chatId, remoteJidInput);
+    remoteJid = chat?.remote_jid || remoteJidInput;
+    const resolution = chat?.instance_name
+      ? { resolvedInstanceName: chat.instance_name }
+      : await resolveWhatsAppInstance(remoteJid);
+    instanceName = resolution.resolvedInstanceName;
+
+    const altPhone = remoteJid ? await findAltPhone(admin, user.id, instanceName, remoteJid) : null;
+    contact = await findContact(admin, user.id, instanceName, remoteJid, altPhone);
+    const identity = resolveContactIdentity({
+      contact: contact ? { ...contact, phone_number: contact.phone_number || altPhone } : { phone_number: altPhone },
+      chat,
+      remoteJid,
     });
+    phone = identity.phoneNumber || altPhone || null;
+    const send = resolveSendJid({ remoteJid, phoneNumber: phone });
+    const diagnostics = {
+      chatId: chat?.id || chatId || null,
+      chatFound: Boolean(chat),
+      contactFound: Boolean(contact),
+      instanceName,
+      remoteJid,
+      resolvedSendJid: send.sendJid,
+      phoneNumber: phone,
+      isLid: isLidJid(remoteJid),
+      sendStrategy: send.sendStrategy,
+      canSend: send.canSendMessage,
+      evolutionEndpoint: getEvolutionUrl(`/message/sendText/${instanceName}`),
+      message: send.reason,
+    };
+
+    if (!send.canSendMessage || !send.sendTarget) {
+      return NextResponse.json({
+        success: false,
+        stage: 'resolveSendJid',
+        ...diagnostics,
+        error: send.reason || 'Nao foi possivel resolver destinatario de envio.',
+      }, { status: 400 });
+    }
+
+    console.log('[whatsapp-send] sending', diagnostics);
+    const response = await sendEvolutionMessage(instanceName, send.sendStrategy === 'phone_jid' ? (phone || '') : send.sendTarget, text, {
+      remoteJid: send.sendStrategy === 'phone_jid' ? undefined : send.sendTarget,
+    });
+
     const now = new Date().toISOString();
     const messageId =
       response?.key?.id ||
+      response?.message?.key?.id ||
       response?.id ||
       stableMessageId([instanceName, remoteJid, now, true, text]);
 
     const row = {
-      user_id: chat?.user_id || user.id,
+      user_id: user.id,
       instance_name: instanceName,
       remote_jid: remoteJid,
       message_id: messageId,
       message_key: messageId,
       from_me: true,
+      sender_jid: null,
+      sender_name: 'Voce',
+      push_name: 'Voce',
       message_type: 'conversation',
       content: text,
       text,
@@ -127,7 +214,7 @@ export async function POST(req: Request) {
       created_at: now,
       updated_at: now,
       message_timestamp: now,
-      phone_normalized: phone || null,
+      phone_normalized: phone,
       direction: 'outbound',
       provider: 'evolution',
       raw_payload: response,
@@ -140,70 +227,71 @@ export async function POST(req: Request) {
       .maybeSingle();
     if (messageError) throw messageError;
 
+    const chatPatch = {
+      user_id: user.id,
+      instance_name: instanceName,
+      remote_jid: remoteJid,
+      phone_number: phone,
+      chat_name: identity.displayName,
+      push_name: identity.displayName,
+      profile_pic_url: identity.profilePicUrl,
+      last_message: text,
+      last_message_text: text,
+      last_message_at: now,
+      unread_count: 0,
+      is_group: identity.isGroup,
+      pipeline_stage: chat?.pipeline_stage || 'new',
+      updated_at: now,
+    };
+
     const { error: chatError } = await admin
       .from('whatsapp_chats')
-      .upsert(
-        {
-          user_id: row.user_id,
-          instance_name: instanceName,
-          remote_jid: remoteJid,
-          phone_number: phone || null,
-          last_message: text,
-          last_message_text: text,
-          last_message_at: now,
-          unread_count: 0,
-          pipeline_stage: 'new',
-          updated_at: now,
-        },
-        { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false }
-      );
+      .upsert(chatPatch, { onConflict: 'user_id,instance_name,remote_jid', ignoreDuplicates: false });
     if (chatError) throw chatError;
 
     return NextResponse.json({
       success: true,
-      sendStrategy: phone ? 'phone_jid' : 'lid_direct',
-      resolvedSendJid: phone ? `${phone}@s.whatsapp.net` : remoteJid,
-      evolutionEndpoint: diagnostics.endpoint,
-      message: saved,
+      stage: 'sent',
       diagnostics,
+      message: saved,
+      evolutionResponse: {
+        keyId: response?.key?.id || response?.message?.key?.id || null,
+        status: response?.status || null,
+      },
     });
   } catch (error: any) {
+    const isEvolution = error instanceof EvolutionApiError;
+    const sendReason = isLidJid(remoteJid)
+      ? 'Nao foi possivel enviar: contato sem telefone real associado ao identificador @lid.'
+      : null;
     console.error('[whatsapp-send] failed', {
-      ...diagnostics,
+      instanceName,
+      remoteJid,
+      chatId,
       status: error?.status,
       message: error?.message,
     });
-    return NextResponse.json(
-      {
-        success: false,
-        stage: error instanceof EvolutionApiError ? 'evolutionSend' : 'databaseSave',
-        instanceName,
-        remoteJid,
-        chatId: chat?.id || null,
-        resolvedSendJid: phone ? null : remoteJid,
-        phoneNumber: phone || null,
-        isLid,
-        evolutionEndpoint: diagnostics.endpoint,
-        evolutionStatusCode: error?.status || null,
-        evolutionResponse: error instanceof EvolutionApiError ? safeJson(error.body) : null,
-        databaseError: error instanceof EvolutionApiError ? null : {
-          code: error?.code,
-          message: error?.message,
-          details: error?.details,
-          hint: error?.hint,
-        },
-        error: friendlySendError(error),
-        details: diagnostics,
-      },
-      { status: error instanceof EvolutionApiError ? 502 : 500 }
-    );
-  }
-}
 
-function safeJson(value: string) {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
+    return NextResponse.json({
+      success: false,
+      stage: isEvolution ? 'evolutionSend' : 'databaseSave',
+      chatId: chat?.id || chatId || null,
+      remoteJid,
+      resolvedSendJid: phone ? `${phone}@s.whatsapp.net` : remoteJid || null,
+      phoneNumber: phone,
+      isLid: isLidJid(remoteJid),
+      sendStrategy: phone ? 'phone_jid' : isLidJid(remoteJid) ? 'lid_direct' : 'failed',
+      instanceName,
+      evolutionEndpoint: instanceName ? getEvolutionUrl(`/message/sendText/${instanceName}`) : null,
+      evolutionStatusCode: isEvolution ? error.status : null,
+      evolutionResponse: isEvolution ? safeJson(error.body) : null,
+      databaseError: isEvolution ? null : {
+        code: error?.code,
+        message: error?.message,
+        details: error?.details,
+        hint: error?.hint,
+      },
+      error: friendlySendError(error, sendReason),
+    }, { status: isEvolution ? 502 : 500 });
   }
 }

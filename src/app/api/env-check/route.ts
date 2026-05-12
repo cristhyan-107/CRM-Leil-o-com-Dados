@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { getEvolutionWebhookUrl } from '@/lib/evolution';
 
 export const dynamic = 'force-dynamic';
 
@@ -23,6 +24,11 @@ function maskSecret(value: string | undefined) {
 }
 
 export async function GET() {
+  const webhookUrl = getEvolutionWebhookUrl();
+  const maskedWebhookUrl = process.env.EVOLUTION_WEBHOOK_SECRET
+    ? webhookUrl.replace(encodeURIComponent(process.env.EVOLUTION_WEBHOOK_SECRET), '***')
+    : webhookUrl;
+
   return NextResponse.json({
     NEXT_PUBLIC_SUPABASE_URL: exists('NEXT_PUBLIC_SUPABASE_URL'),
     NEXT_PUBLIC_SUPABASE_ANON_KEY: exists('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
@@ -36,6 +42,7 @@ export async function GET() {
       EVOLUTION_INSTANCE_NAME: process.env.EVOLUTION_INSTANCE_NAME || null,
       EVOLUTION_API_KEY: maskSecret(process.env.EVOLUTION_API_KEY),
       EVOLUTION_WEBHOOK_SECRET: maskSecret(process.env.EVOLUTION_WEBHOOK_SECRET),
+      EVOLUTION_WEBHOOK_URL: maskedWebhookUrl,
       SUPABASE_SERVICE_ROLE_KEY: maskSecret(process.env.SUPABASE_SERVICE_ROLE_KEY),
     },
   });

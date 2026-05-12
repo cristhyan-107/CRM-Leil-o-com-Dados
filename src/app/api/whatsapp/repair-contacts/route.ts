@@ -4,6 +4,9 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import {
   extractPhoneFromJid,
   isLidJid,
+  isLikelyLidNumber,
+  isLikelyHumanName,
+  isValidPhoneNumber,
   resolveContactIdentity,
 } from '@/lib/whatsapp-normalize';
 
@@ -59,7 +62,12 @@ export async function POST() {
   for (const contact of contacts || []) {
     contactsProcessed += 1;
     const crossPhone = phoneByJid.get(contact.remote_jid);
-    const phone = contact.phone_number || crossPhone || extractPhoneFromJid(contact.remote_jid);
+    const currentPhone = String(contact.phone_number || '').replace(/\D/g, '');
+    const phone = (
+      isValidPhoneNumber(currentPhone) && !isLikelyLidNumber(currentPhone, contact.remote_jid)
+        ? currentPhone
+        : ''
+    ) || crossPhone || extractPhoneFromJid(contact.remote_jid);
     if (isLidJid(contact.remote_jid) && !phone) {
       lidSkipped += 1;
     }
@@ -75,14 +83,16 @@ export async function POST() {
     if (phone && phone !== contact.phone_number) {
       patch.phone_number = phone;
       phonesUpdated += 1;
+    } else if (!phone && contact.phone_number && isLikelyLidNumber(contact.phone_number, contact.remote_jid)) {
+      patch.phone_number = null;
+      phonesUpdated += 1;
     }
 
     // Only update name if it's better than current (not a JID)
-    const currentNameIsRaw = !contact.display_name ||
-      contact.display_name.includes('@s.whatsapp.net') ||
-      contact.display_name.includes('@lid') ||
-      contact.display_name.includes('@c.us') ||
-      contact.display_name.includes('@g.us');
+    const currentNameIsRaw = !isLikelyHumanName(contact.display_name, {
+      remoteJid: contact.remote_jid,
+      phoneNumber: phone,
+    });
     if (identity.displayName && identity.displayNameSource !== 'fallback' && currentNameIsRaw) {
       patch.display_name = identity.displayName;
       namesUpdated += 1;
@@ -100,7 +110,17 @@ export async function POST() {
     chatsProcessed += 1;
     const contact = contactByJid.get(chat.remote_jid);
     const crossPhone = phoneByJid.get(chat.remote_jid);
-    const phone = chat.phone_number || contact?.phone_number || crossPhone || extractPhoneFromJid(chat.remote_jid);
+    const currentChatPhone = String(chat.phone_number || '').replace(/\D/g, '');
+    const currentContactPhone = String(contact?.phone_number || '').replace(/\D/g, '');
+    const phone = (
+      isValidPhoneNumber(currentChatPhone) && !isLikelyLidNumber(currentChatPhone, chat.remote_jid)
+        ? currentChatPhone
+        : ''
+    ) || (
+      isValidPhoneNumber(currentContactPhone) && !isLikelyLidNumber(currentContactPhone, chat.remote_jid)
+        ? currentContactPhone
+        : ''
+    ) || crossPhone || extractPhoneFromJid(chat.remote_jid);
     if (isLidJid(chat.remote_jid) && !phone) {
       lidSkipped += 1;
     }
@@ -117,14 +137,16 @@ export async function POST() {
     if (phone && phone !== chat.phone_number) {
       patch.phone_number = phone;
       phonesUpdated += 1;
+    } else if (!phone && chat.phone_number && isLikelyLidNumber(chat.phone_number, chat.remote_jid)) {
+      patch.phone_number = null;
+      phonesUpdated += 1;
     }
 
     // Name — only fix if current is raw or empty
-    const currentChatNameIsRaw = !chat.chat_name ||
-      chat.chat_name.includes('@s.whatsapp.net') ||
-      chat.chat_name.includes('@lid') ||
-      chat.chat_name.includes('@c.us') ||
-      chat.chat_name.includes('@g.us');
+    const currentChatNameIsRaw = !isLikelyHumanName(chat.chat_name, {
+      remoteJid: chat.remote_jid,
+      phoneNumber: phone,
+    });
     if (identity.displayName && identity.displayNameSource !== 'fallback' && currentChatNameIsRaw) {
       patch.chat_name = identity.displayName;
       patch.push_name = identity.displayName;

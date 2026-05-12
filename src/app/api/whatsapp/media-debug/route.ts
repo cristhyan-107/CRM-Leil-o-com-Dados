@@ -18,18 +18,21 @@ export async function GET(req: Request) {
   const { count: totalWithMedia } = await admin
     .from('whatsapp_messages')
     .select('id', { count: 'exact', head: true })
+    .eq('user_id', user.id)
     .eq('instance_name', instanceName)
     .eq('has_media', true);
 
   const { count: totalWithMediaUrl } = await admin
     .from('whatsapp_messages')
     .select('id', { count: 'exact', head: true })
+    .eq('user_id', user.id)
     .eq('instance_name', instanceName)
     .not('media_url', 'is', null);
 
   const { data: samples } = await admin
     .from('whatsapp_messages')
     .select('id, message_id, remote_jid, message_type, has_media, media_mimetype, media_filename, media_url, created_at')
+    .eq('user_id', user.id)
     .eq('instance_name', instanceName)
     .eq('has_media', true)
     .order('created_at', { ascending: false })

@@ -2,7 +2,11 @@ import { NextResponse } from 'next/server';
 import { createServerSupabase } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { sendEvolutionMessage } from '@/lib/evolution';
-import { formatBrazilianPhone, resolveContactIdentity } from '@/lib/whatsapp-normalize';
+import {
+  formatBrazilianPhone,
+  normalizeBrazilianPhoneNumber,
+  resolveContactIdentity,
+} from '@/lib/whatsapp-normalize';
 import { resolveWhatsAppInstance } from '@/app/(app)/settings/whatsapp/actions';
 
 export const dynamic = 'force-dynamic';
@@ -20,7 +24,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ success: false, error: 'Número inválido. Mínimo 10 dígitos (DDD + número).' }, { status: 400 });
   }
 
-  const fullNumber = rawPhone.startsWith('55') ? rawPhone : `55${rawPhone}`;
+  const fullNumber = normalizeBrazilianPhoneNumber(rawPhone);
   if (fullNumber.length < 12 || fullNumber.length > 13) {
     return NextResponse.json({ success: false, error: 'Número inválido. Verifique DDD e número.' }, { status: 400 });
   }
