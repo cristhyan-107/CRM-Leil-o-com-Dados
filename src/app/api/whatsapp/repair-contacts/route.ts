@@ -3,178 +3,261 @@ import { createServerSupabase } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import {
   extractPhoneFromJid,
+  formatBrazilianPhone,
   isLidJid,
-  isLikelyLidNumber,
   isLikelyHumanName,
+  isLikelyLidNumber,
   isValidPhoneNumber,
-  resolveContactIdentity,
 } from '@/lib/whatsapp-normalize';
+import { resolveWhatsAppInstance } from '@/app/(app)/settings/whatsapp/actions';
 
 export const dynamic = 'force-dynamic';
 
-export async function POST() {
+type Change = {
+  table: 'whatsapp_chats' | 'whatsapp_contacts';
+  id: string;
+  remoteJid: string;
+  field: 'phone_number' | 'display_name' | 'chat_name' | 'push_name' | 'profile_pic_url';
+  from: string | null;
+  to: string | null;
+  reason: string;
+  confidence: 'high' | 'medium' | 'low';
+};
+
+function cleanPhone(value: unknown) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function hasUsablePhone(value: unknown, remoteJid: string) {
+  const phone = cleanPhone(value);
+  return Boolean(phone && isValidPhoneNumber(phone) && !isLikelyLidNumber(phone, remoteJid));
+}
+
+function pushChange(changes: Change[], change: Change) {
+  changes.push(change);
+}
+
+function duplicateGroups(rows: any[], field: 'phone_number' | 'profile_pic_url') {
+  const groups = new Map<string, any[]>();
+  for (const row of rows) {
+    const value = String(row[field] || '').trim();
+    if (!value) continue;
+    const list = groups.get(value) || [];
+    list.push(row);
+    groups.set(value, list);
+  }
+
+  return [...groups.entries()]
+    .map(([value, list]) => ({
+      value,
+      count: list.length,
+      remoteJids: [...new Set(list.map((row) => row.remote_jid))],
+      examples: list.slice(0, 5).map((row) => ({
+        id: row.id,
+        remoteJid: row.remote_jid,
+        name: row.chat_name || row.display_name || row.push_name || null,
+      })),
+    }))
+    .filter((group) => group.remoteJids.length > 1);
+}
+
+async function applyChange(admin: ReturnType<typeof createAdminClient>, change: Change) {
+  const patch: Record<string, unknown> = {
+    [change.field]: change.to,
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await admin.from(change.table).update(patch).eq('id', change.id);
+  if (error) throw error;
+}
+
+export async function POST(req: Request) {
   const supabase = await createServerSupabase();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 });
 
+  const body = await req.json().catch(() => ({}));
+  const dryRun = body.dryRun !== false;
   const admin = createAdminClient();
+  const instanceName = (await resolveWhatsAppInstance()).resolvedInstanceName;
   const errors: string[] = [];
-  let contactsProcessed = 0;
-  let chatsProcessed = 0;
-  let namesUpdated = 0;
-  let phonesUpdated = 0;
-  let profilePicturesUpdated = 0;
-  let lidSkipped = 0;
-  let rawJidFixed = 0;
 
-  const { data: chats } = await admin
+  const { data: chats, error: chatsError } = await admin
     .from('whatsapp_chats')
-    .select('*')
+    .select('id, remote_jid, phone_number, chat_name, push_name, profile_pic_url, updated_at')
     .eq('user_id', user.id)
-    .limit(1000);
-
-  const { data: contacts } = await admin
-    .from('whatsapp_contacts')
-    .select('*')
-    .eq('user_id', user.id)
+    .eq('instance_name', instanceName)
     .limit(2000);
+  if (chatsError) return NextResponse.json({ success: false, dryRun, error: chatsError.message }, { status: 500 });
 
-  const contactByJid = new Map((contacts || []).map((contact: any) => [contact.remote_jid, contact]));
-
-  // Cross-reference phone numbers from messages raw_payload
-  const { data: altRows } = await admin
-    .from('whatsapp_messages')
-    .select('remote_jid, raw_payload')
+  const { data: contacts, error: contactsError } = await admin
+    .from('whatsapp_contacts')
+    .select('id, remote_jid, phone_number, display_name, push_name, verified_name, business_name, profile_pic_url, updated_at')
     .eq('user_id', user.id)
-    .not('raw_payload', 'is', null)
+    .eq('instance_name', instanceName)
     .limit(5000);
-  const phoneByJid = new Map<string, string>();
-  for (const row of altRows || []) {
-    const alt = (row as any)?.raw_payload?.key?.remoteJidAlt;
-    const participant = (row as any)?.raw_payload?.key?.participant;
-    const phone = extractPhoneFromJid(alt) || extractPhoneFromJid(participant);
-    if (phone && !phoneByJid.has((row as any).remote_jid)) {
-      phoneByJid.set((row as any).remote_jid, phone);
-    }
-  }
+  if (contactsError) return NextResponse.json({ success: false, dryRun, error: contactsError.message }, { status: 500 });
 
-  // Fix contacts
+  const allRows = [...(chats || []), ...(contacts || [])];
+  const duplicatePhoneGroups = duplicateGroups(allRows, 'phone_number');
+  const duplicateProfilePicGroups = duplicateGroups(allRows, 'profile_pic_url');
+  const duplicatedProfilePics = new Set(duplicateProfilePicGroups.map((group) => group.value));
+  const changes: Change[] = [];
+
   for (const contact of contacts || []) {
-    contactsProcessed += 1;
-    const crossPhone = phoneByJid.get(contact.remote_jid);
-    const currentPhone = String(contact.phone_number || '').replace(/\D/g, '');
-    const phone = (
-      isValidPhoneNumber(currentPhone) && !isLikelyLidNumber(currentPhone, contact.remote_jid)
-        ? currentPhone
-        : ''
-    ) || crossPhone || extractPhoneFromJid(contact.remote_jid);
-    if (isLidJid(contact.remote_jid) && !phone) {
-      lidSkipped += 1;
+    const jid = contact.remote_jid;
+    const extractedPhone = extractPhoneFromJid(jid);
+    const currentPhone = cleanPhone(contact.phone_number);
+
+    if (extractedPhone && currentPhone !== extractedPhone) {
+      pushChange(changes, {
+        table: 'whatsapp_contacts',
+        id: contact.id,
+        remoteJid: jid,
+        field: 'phone_number',
+        from: contact.phone_number || null,
+        to: extractedPhone,
+        reason: 'phone_from_same_remote_jid',
+        confidence: 'high',
+      });
+    } else if (isLidJid(jid) && currentPhone) {
+      pushChange(changes, {
+        table: 'whatsapp_contacts',
+        id: contact.id,
+        remoteJid: jid,
+        field: 'phone_number',
+        from: contact.phone_number,
+        to: null,
+        reason: hasUsablePhone(currentPhone, jid) ? 'lid_phone_not_trusted_for_identity' : 'lid_identifier_or_invalid_phone',
+        confidence: 'high',
+      });
     }
 
-    const identity = resolveContactIdentity({
-      contact: { ...contact, phone_number: phone },
-      remoteJid: contact.remote_jid,
-    });
-
-    const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
-
-    // Only update phone if we found one and it's different
-    if (phone && phone !== contact.phone_number) {
-      patch.phone_number = phone;
-      phonesUpdated += 1;
-    } else if (!phone && contact.phone_number && isLikelyLidNumber(contact.phone_number, contact.remote_jid)) {
-      patch.phone_number = null;
-      phonesUpdated += 1;
-    }
-
-    // Only update name if it's better than current (not a JID)
     const currentNameIsRaw = !isLikelyHumanName(contact.display_name, {
-      remoteJid: contact.remote_jid,
-      phoneNumber: phone,
+      remoteJid: jid,
+      phoneNumber: extractedPhone || currentPhone,
     });
-    if (identity.displayName && identity.displayNameSource !== 'fallback' && currentNameIsRaw) {
-      patch.display_name = identity.displayName;
-      namesUpdated += 1;
-      if (currentNameIsRaw && contact.display_name) rawJidFixed += 1;
+    if (currentNameIsRaw && contact.display_name && contact.display_name !== 'Contato WhatsApp') {
+      pushChange(changes, {
+        table: 'whatsapp_contacts',
+        id: contact.id,
+        remoteJid: jid,
+        field: 'display_name',
+        from: contact.display_name,
+        to: 'Contato WhatsApp',
+        reason: 'display_name_would_leak_raw_identifier',
+        confidence: 'high',
+      });
     }
 
-    if (Object.keys(patch).length > 1) {
-      const { error } = await admin.from('whatsapp_contacts').update(patch).eq('id', contact.id);
-      if (error) errors.push(`contact ${contact.id}: ${error.message}`);
+    if (isLidJid(jid) && contact.profile_pic_url && duplicatedProfilePics.has(contact.profile_pic_url)) {
+      pushChange(changes, {
+        table: 'whatsapp_contacts',
+        id: contact.id,
+        remoteJid: jid,
+        field: 'profile_pic_url',
+        from: contact.profile_pic_url,
+        to: null,
+        reason: 'duplicate_profile_pic_on_lid_suspicious',
+        confidence: 'high',
+      });
     }
   }
 
-  // Fix chats
   for (const chat of chats || []) {
-    chatsProcessed += 1;
-    const contact = contactByJid.get(chat.remote_jid);
-    const crossPhone = phoneByJid.get(chat.remote_jid);
-    const currentChatPhone = String(chat.phone_number || '').replace(/\D/g, '');
-    const currentContactPhone = String(contact?.phone_number || '').replace(/\D/g, '');
-    const phone = (
-      isValidPhoneNumber(currentChatPhone) && !isLikelyLidNumber(currentChatPhone, chat.remote_jid)
-        ? currentChatPhone
-        : ''
-    ) || (
-      isValidPhoneNumber(currentContactPhone) && !isLikelyLidNumber(currentContactPhone, chat.remote_jid)
-        ? currentContactPhone
-        : ''
-    ) || crossPhone || extractPhoneFromJid(chat.remote_jid);
-    if (isLidJid(chat.remote_jid) && !phone) {
-      lidSkipped += 1;
+    const jid = chat.remote_jid;
+    const extractedPhone = extractPhoneFromJid(jid);
+    const currentPhone = cleanPhone(chat.phone_number);
+
+    if (extractedPhone && currentPhone !== extractedPhone) {
+      pushChange(changes, {
+        table: 'whatsapp_chats',
+        id: chat.id,
+        remoteJid: jid,
+        field: 'phone_number',
+        from: chat.phone_number || null,
+        to: extractedPhone,
+        reason: 'phone_from_same_remote_jid',
+        confidence: 'high',
+      });
+    } else if (isLidJid(jid) && currentPhone) {
+      pushChange(changes, {
+        table: 'whatsapp_chats',
+        id: chat.id,
+        remoteJid: jid,
+        field: 'phone_number',
+        from: chat.phone_number,
+        to: null,
+        reason: hasUsablePhone(currentPhone, jid) ? 'lid_phone_not_trusted_for_identity' : 'lid_identifier_or_invalid_phone',
+        confidence: 'high',
+      });
     }
 
-    const identity = resolveContactIdentity({
-      contact,
-      chat: { ...chat, phone_number: phone },
-      remoteJid: chat.remote_jid,
-    });
-
-    const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
-
-    // Phone
-    if (phone && phone !== chat.phone_number) {
-      patch.phone_number = phone;
-      phonesUpdated += 1;
-    } else if (!phone && chat.phone_number && isLikelyLidNumber(chat.phone_number, chat.remote_jid)) {
-      patch.phone_number = null;
-      phonesUpdated += 1;
-    }
-
-    // Name — only fix if current is raw or empty
     const currentChatNameIsRaw = !isLikelyHumanName(chat.chat_name, {
-      remoteJid: chat.remote_jid,
-      phoneNumber: phone,
+      remoteJid: jid,
+      phoneNumber: extractedPhone || currentPhone,
     });
-    if (identity.displayName && identity.displayNameSource !== 'fallback' && currentChatNameIsRaw) {
-      patch.chat_name = identity.displayName;
-      patch.push_name = identity.displayName;
-      namesUpdated += 1;
-      if (currentChatNameIsRaw && chat.chat_name) rawJidFixed += 1;
+    if (currentChatNameIsRaw && chat.chat_name && chat.chat_name !== 'Contato WhatsApp') {
+      pushChange(changes, {
+        table: 'whatsapp_chats',
+        id: chat.id,
+        remoteJid: jid,
+        field: 'chat_name',
+        from: chat.chat_name,
+        to: extractedPhone ? formatBrazilianPhone(extractedPhone) : 'Contato WhatsApp',
+        reason: 'chat_name_would_leak_raw_identifier',
+        confidence: 'high',
+      });
     }
 
-    // Profile pic — never overwrite good with null
-    if (contact?.profile_pic_url && !chat.profile_pic_url) {
-      patch.profile_pic_url = contact.profile_pic_url;
-      profilePicturesUpdated += 1;
-    }
-
-    if (Object.keys(patch).length > 1) {
-      const { error } = await admin.from('whatsapp_chats').update(patch).eq('id', chat.id);
-      if (error) errors.push(`chat ${chat.id}: ${error.message}`);
+    if (isLidJid(jid) && chat.profile_pic_url && duplicatedProfilePics.has(chat.profile_pic_url)) {
+      pushChange(changes, {
+        table: 'whatsapp_chats',
+        id: chat.id,
+        remoteJid: jid,
+        field: 'profile_pic_url',
+        from: chat.profile_pic_url,
+        to: null,
+        reason: 'duplicate_profile_pic_on_lid_suspicious',
+        confidence: 'high',
+      });
     }
   }
+
+  const safeChanges = changes.filter((change) => change.confidence === 'high');
+  const changed: Change[] = [];
+
+  if (!dryRun) {
+    for (const change of safeChanges) {
+      try {
+        await applyChange(admin, change);
+        changed.push(change);
+      } catch (error: any) {
+        errors.push(`${change.table}:${change.id}:${change.field}:${error?.message || 'erro desconhecido'}`);
+      }
+    }
+  }
+
+  const phoneChanges = safeChanges.filter((change) => change.field === 'phone_number');
+  const profilePicChanges = safeChanges.filter((change) => change.field === 'profile_pic_url');
+  const nameChanges = safeChanges.filter((change) => change.field === 'display_name' || change.field === 'chat_name' || change.field === 'push_name');
 
   return NextResponse.json({
     success: errors.length === 0,
-    contactsProcessed,
-    chatsProcessed,
-    namesUpdated,
-    phonesUpdated,
-    profilePicturesUpdated,
-    lidSkipped,
-    rawJidFixed,
+    dryRun,
+    contactsProcessed: contacts?.length || 0,
+    chatsProcessed: chats?.length || 0,
+    phonesFixed: phoneChanges.filter((change) => change.to).length,
+    phonesClearedAsSuspicious: phoneChanges.filter((change) => !change.to).length,
+    profilePicsFixed: 0,
+    profilePicsClearedAsSuspicious: profilePicChanges.length,
+    namesUpdated: nameChanges.length,
+    duplicatePhoneGroupsFound: duplicatePhoneGroups.length,
+    duplicateProfilePicGroupsFound: duplicateProfilePicGroups.length,
+    rawJidFixed: nameChanges.length,
+    wouldChange: safeChanges.slice(0, 100),
+    changed: changed.slice(0, 100),
     errors,
   });
 }

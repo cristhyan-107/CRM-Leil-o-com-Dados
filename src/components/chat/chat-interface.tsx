@@ -15,6 +15,14 @@ import {
   RotateCcw,
   Plus,
   X,
+  MoreVertical,
+  Archive,
+  Trash2,
+  FileText,
+  Download,
+  Image as ImageIcon,
+  Volume2,
+  Video,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
@@ -82,6 +90,10 @@ interface Contact {
   isLid?: boolean;
   canSendMessage?: boolean;
   sendJid?: string | null;
+  identityConfidence?: 'high' | 'medium' | 'low';
+  identitySource?: string;
+  possibleWrongPhone?: boolean;
+  possibleWrongProfilePic?: boolean;
 }
 
 interface Message {
@@ -99,6 +111,102 @@ interface Message {
   media_filename?: string | null;
   media_url?: string | null;
   _error?: string;
+}
+
+function mediaLabel(kind: ReturnType<typeof getMediaKind>) {
+  if (kind === 'image') return 'imagem';
+  if (kind === 'audio') return 'audio';
+  if (kind === 'video') return 'video';
+  return 'midia';
+}
+
+function mediaSource(msg: Message) {
+  const token = msg.id || msg.message_id;
+  return token ? `/api/whatsapp/messages/${encodeURIComponent(token)}/media` : msg.media_url || '';
+}
+
+function MediaAttachment({ msg }: { msg: Message }) {
+  const [failed, setFailed] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
+  const kind = getMediaKind(msg);
+  const src = mediaSource(msg);
+  const filename = msg.media_filename || mediaLabel(kind);
+
+  if (!kind) return null;
+
+  const fallback = (
+    <div className="mb-2 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-gray-300">
+      <div className="flex items-center gap-2">
+        {kind === 'image' ? <ImageIcon className="h-4 w-4" /> : kind === 'audio' ? <Volume2 className="h-4 w-4" /> : kind === 'video' ? <Video className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
+        <span className="min-w-0 flex-1 truncate">
+          {failed ? 'Nao foi possivel carregar midia' : filename}
+        </span>
+      </div>
+      <div className="mt-2 flex gap-2">
+        {src && (
+          <a
+            href={`${src}${src.includes('?') ? '&' : '?'}retry=${retryKey}`}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 rounded-lg bg-white/[0.06] px-2 py-1 text-blue-100 hover:bg-white/[0.1]"
+          >
+            <Download className="h-3.5 w-3.5" />
+            Abrir
+          </a>
+        )}
+        {failed && (
+          <button
+            type="button"
+            onClick={() => {
+              setFailed(false);
+              setRetryKey((value) => value + 1);
+            }}
+            className="rounded-lg bg-white/[0.06] px-2 py-1 text-gray-100 hover:bg-white/[0.1]"
+          >
+            Tentar novamente
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
+  if (!src || failed) return fallback;
+  const keyedSrc = `${src}${src.includes('?') ? '&' : '?'}retry=${retryKey}`;
+
+  if (kind === 'image') {
+    return (
+      <div className="mb-2 overflow-hidden rounded-xl border border-white/10 bg-black/20">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={keyedSrc}
+          alt={filename}
+          className="max-h-72 w-full object-contain"
+          onError={() => setFailed(true)}
+        />
+      </div>
+    );
+  }
+
+  if (kind === 'audio') {
+    return (
+      <div className="mb-2 rounded-xl border border-white/10 bg-black/20 px-3 py-2">
+        <audio controls src={keyedSrc} className="w-full max-w-[260px]" onError={() => setFailed(true)} />
+      </div>
+    );
+  }
+
+  if (kind === 'video') {
+    return (
+      <video
+        controls
+        src={keyedSrc}
+        className="mb-2 max-h-72 max-w-full rounded-xl border border-white/10 bg-black/20"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+
+  return fallback;
 }
 
 
@@ -127,6 +235,8 @@ export function ChatInterface({
   const [historyError, setHistoryError] = useState('');
   const [isSyncingHistory, setIsSyncingHistory] = useState(false);
   const [brokenAvatars, setBrokenAvatars] = useState<Set<string>>(() => new Set());
+  const [openMenuJid, setOpenMenuJid] = useState<string | null>(null);
+  const [chatActionError, setChatActionError] = useState('');
 
   // Modal nova conversa
   const [showNewConv, setShowNewConv] = useState(false);
@@ -520,6 +630,31 @@ export function ChatInterface({
     setNewConvLoading(false);
   };
 
+  async function updateChatVisibility(contact: Contact, action: 'archive' | 'delete-local') {
+    if (contact.id.startsWith('synthetic_') || contact.id.startsWith('new_')) return;
+    if (action === 'delete-local') {
+      const confirmed = window.confirm('Excluir esta conversa apenas do CRM? As mensagens nao serao apagadas fisicamente.');
+      if (!confirmed) return;
+    }
+
+    setChatActionError('');
+    setOpenMenuJid(null);
+    try {
+      const response = await fetch(`/api/whatsapp/chats/${contact.id}/${action}`, { method: 'POST' });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Nao foi possivel atualizar a conversa.');
+      }
+      setInbox((prev) => prev.filter((item) => item.id !== contact.id));
+      if (selectedContact?.id === contact.id) {
+        setSelectedContact(null);
+        setMessages([]);
+      }
+    } catch (error) {
+      setChatActionError(error instanceof Error ? error.message : 'Erro ao atualizar conversa.');
+    }
+  }
+
   const filteredInbox = inbox.filter(
     (c) =>
       c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -625,6 +760,9 @@ export function ChatInterface({
               className="w-full h-9 pl-9 pr-4 bg-white/[0.03] border border-white/[0.06] rounded-lg text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500/50 transition-colors"
             />
           </div>
+          {chatActionError && (
+            <p className="mt-2 text-xs text-red-400">{chatActionError}</p>
+          )}
         </div>
 
         {/* Lista */}
@@ -649,11 +787,16 @@ export function ChatInterface({
               {filteredInbox.map((contact) => {
                 const isActive = selectedContact?.remoteJid === contact.remoteJid;
                 return (
-                  <button
+                  <div
                     key={contact.remoteJid}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => setSelectedContact(contact)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') setSelectedContact(contact);
+                    }}
                     className={cn(
-                      'w-full flex items-center gap-3 p-3 rounded-xl transition-all text-left',
+                      'w-full flex items-center gap-3 p-3 rounded-xl transition-all text-left cursor-pointer',
                       isActive
                         ? 'bg-blue-500/10 border border-blue-500/20'
                         : 'hover:bg-white/[0.04] border border-transparent'
@@ -708,7 +851,43 @@ export function ChatInterface({
                         {contact.lastMessage || '📎 Anexo'}
                       </p>
                     </div>
-                  </button>
+                    <div className="relative flex-shrink-0">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setOpenMenuJid((current) => current === contact.remoteJid ? null : contact.remoteJid);
+                        }}
+                        className="rounded-lg p-1.5 text-gray-500 hover:bg-white/[0.06] hover:text-gray-200"
+                        title="Acoes da conversa"
+                      >
+                        <MoreVertical className="h-4 w-4" />
+                      </button>
+                      {openMenuJid === contact.remoteJid && (
+                        <div
+                          onClick={(event) => event.stopPropagation()}
+                          className="absolute right-0 top-8 z-20 w-44 rounded-lg border border-white/10 bg-[#111827] p-1 shadow-xl"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => updateChatVisibility(contact, 'archive')}
+                            className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs text-gray-200 hover:bg-white/[0.06]"
+                          >
+                            <Archive className="h-3.5 w-3.5" />
+                            Arquivar conversa
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => updateChatVisibility(contact, 'delete-local')}
+                            className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs text-red-200 hover:bg-red-500/10"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Excluir do CRM
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 );
               })}
             </div>
@@ -815,11 +994,8 @@ export function ChatInterface({
                       !prevMsg ||
                       new Date(msg.created_at).toDateString() !==
                         new Date(prevMsg.created_at).toDateString();
-                    const mediaKind = getMediaKind(msg);
-                    const mediaSrc = msg.message_id
-                      ? (msg.media_url || `/api/whatsapp/messages/${encodeURIComponent(msg.message_id)}/media`)
-                      : msg.media_url || '';
-
+                    let mediaKind: ReturnType<typeof getMediaKind> = null;
+                    let mediaSrc = '';
                     return (
                       <div key={msg.id || idx}>
                         {showDateSep && (
@@ -849,6 +1025,7 @@ export function ChatInterface({
                                 : 'bg-[#161c28] border border-white/[0.04] text-gray-100 rounded-2xl rounded-bl-sm'
                             )}
                           >
+                            <MediaAttachment msg={msg} />
                             {mediaKind === 'image' && mediaSrc ? (
                               <div className="mb-2 overflow-hidden rounded-xl border border-white/10">
                                 {/* eslint-disable-next-line @next/next/no-img-element */}

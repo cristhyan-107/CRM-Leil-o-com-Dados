@@ -65,8 +65,7 @@ async function findContact(
   admin: ReturnType<typeof createAdminClient>,
   userId: string,
   instanceName: string,
-  remoteJid: string,
-  phone?: string | null
+  remoteJid: string
 ) {
   const { data: direct, error } = await admin
     .from('whatsapp_contacts')
@@ -79,20 +78,6 @@ async function findContact(
     .maybeSingle();
   if (error) throw error;
   if (direct) return direct;
-
-  if (phone) {
-    const { data: byPhone, error: phoneError } = await admin
-      .from('whatsapp_contacts')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('instance_name', instanceName)
-      .eq('phone_number', phone)
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (phoneError) throw phoneError;
-    if (byPhone) return byPhone;
-  }
 
   return null;
 }
@@ -152,7 +137,7 @@ export async function POST(req: Request) {
     instanceName = resolution.resolvedInstanceName;
 
     const altPhone = remoteJid ? await findAltPhone(admin, user.id, instanceName, remoteJid) : null;
-    contact = await findContact(admin, user.id, instanceName, remoteJid, altPhone);
+    contact = await findContact(admin, user.id, instanceName, remoteJid);
     const identity = resolveContactIdentity({
       contact: contact ? { ...contact, phone_number: contact.phone_number || altPhone } : { phone_number: altPhone },
       chat,
@@ -227,11 +212,12 @@ export async function POST(req: Request) {
       .maybeSingle();
     if (messageError) throw messageError;
 
+    const chatPhoneNumber = isLidJid(remoteJid) ? null : phone;
     const chatPatch = {
       user_id: user.id,
       instance_name: instanceName,
       remote_jid: remoteJid,
-      phone_number: phone,
+      phone_number: chatPhoneNumber,
       chat_name: identity.displayName,
       push_name: identity.displayName,
       profile_pic_url: identity.profilePicUrl,

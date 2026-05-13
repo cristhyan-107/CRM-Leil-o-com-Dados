@@ -455,6 +455,8 @@ export async function GET() {
       webhookConfigureRoute: '/api/whatsapp/webhook-configure',
       syncHistoryRoute: '/api/whatsapp/sync-history',
       sendMessageRoute: '/api/whatsapp/send-message',
+      archiveChatRoute: '/api/whatsapp/chats/[chatId]/archive',
+      deleteLocalChatRoute: '/api/whatsapp/chats/[chatId]/delete-local',
       repairContactsRoute: '/api/whatsapp/repair-contacts',
       syncProfilePicturesRoute: '/api/whatsapp/sync-profile-pictures',
       mediaDebugRoute: '/api/whatsapp/media-debug',
@@ -482,6 +484,48 @@ export async function GET() {
       syncHistoryRouteAvailable: true,
       lastHistorySyncAt: null,
       lastHistorySyncImported: 0,
+    };
+
+    const chatVisibility = {
+      activeChats: await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query
+          .eq('instance_name', instanceName)
+          .or('archived.is.false,archived.is.null')
+          .is('deleted_at', null)
+      ),
+      archivedChats: await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query.eq('instance_name', instanceName).eq('archived', true).is('deleted_at', null)
+      ),
+      deletedLocalChats: await countRowsWhere(admin, 'whatsapp_chats', (query) =>
+        query.eq('instance_name', instanceName).not('deleted_at', 'is', null)
+      ),
+    };
+
+    const { data: integrityRows } = await admin
+      .from('whatsapp_chats')
+      .select('remote_jid, phone_number, profile_pic_url, chat_name, push_name')
+      .eq('instance_name', instanceName)
+      .limit(1000);
+    const duplicatePhoneGroups = new Map<string, Set<string>>();
+    const duplicateProfilePicGroups = new Map<string, Set<string>>();
+    for (const row of integrityRows || []) {
+      const phone = String((row as any).phone_number || '').trim();
+      const pic = String((row as any).profile_pic_url || '').trim();
+      if (phone) {
+        const group = duplicatePhoneGroups.get(phone) || new Set<string>();
+        group.add((row as any).remote_jid);
+        duplicatePhoneGroups.set(phone, group);
+      }
+      if (pic) {
+        const group = duplicateProfilePicGroups.get(pic) || new Set<string>();
+        group.add((row as any).remote_jid);
+        duplicateProfilePicGroups.set(pic, group);
+      }
+    }
+    const contactIntegrity = {
+      duplicatePhoneGroups: [...duplicatePhoneGroups.values()].filter((group) => group.size > 1).length,
+      duplicateProfilePicGroups: [...duplicateProfilePicGroups.values()].filter((group) => group.size > 1).length,
+      rawJidShownInUi: 0,
     };
 
     const savedData = {
@@ -521,6 +565,7 @@ export async function GET() {
         ...contactQuality,
         rawJidShownInUi: rawJidInUiResult + numericIdentifierLeaks,
       };
+      contactIntegrity.rawJidShownInUi = contactQualityExtended.rawJidShownInUi;
 
       const finalWhatsAppFix = {
         identityResolverAvailable: true,
@@ -585,8 +630,13 @@ export async function GET() {
         webhook,
         sendMessage,
         contactQuality: contactQualityExtended,
+        chatVisibility,
+        contactIntegrity,
         performance,
-        media,
+        media: {
+          ...media,
+          mediaDebugAvailable: true,
+        },
         history,
         startChat,
         savedData,

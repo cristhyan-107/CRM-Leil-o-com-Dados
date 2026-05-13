@@ -225,20 +225,48 @@ export interface WhatsAppIdentity {
   profilePicUrl: string | null;
   isLid: boolean;
   isGroup: boolean;
+  identityConfidence: 'high' | 'medium' | 'low';
+  identitySource: 'contact_remote_jid' | 'chat_remote_jid' | 'own_payload' | 'phone' | 'push_name' | 'fallback';
+  possibleWrongPhone: boolean;
+  possibleWrongProfilePic: boolean;
   canSendMessage: boolean;
   sendJid: string | null;
   sendStrategy: 'phone_jid' | 'remote_jid' | 'lid_direct' | 'group_jid' | 'failed';
   avatarFallback: string;
 }
 
+function sameRemoteJid(left: unknown, right: unknown) {
+  const a = normalizeWhatsAppJid(left);
+  const b = normalizeWhatsAppJid(right);
+  return Boolean(a && b && a === b);
+}
+
 function resolvePhoneNumber(contact: any, chat: any, rawJid: string) {
+  const isLid = isLidJid(rawJid);
+  const contactMatches = !contact?.remote_jid || sameRemoteJid(contact.remote_jid, rawJid);
+  const chatMatches = !chat?.remote_jid || sameRemoteJid(chat.remote_jid, rawJid);
+
+  if (isLid) {
+    const trustedCandidates = [
+      contact?.trusted_phone_number,
+      contact?.trustedPhoneNumber,
+      chat?.trusted_phone_number,
+      chat?.trustedPhoneNumber,
+    ];
+    for (const candidate of trustedCandidates) {
+      const digits = String(candidate || '').replace(/\D/g, '');
+      if (digits && isValidPhoneNumber(digits) && !isLikelyLidNumber(digits, rawJid)) return digits;
+    }
+    return '';
+  }
+
   const candidates = [
-    contact?.phone_number,
-    contact?.phoneNumber,
-    chat?.phone_number,
-    chat?.phoneNumber,
-    extractPhoneFromJid(contact?.remote_jid),
-    extractPhoneFromJid(chat?.remote_jid),
+    contactMatches ? contact?.phone_number : null,
+    contactMatches ? contact?.phoneNumber : null,
+    chatMatches ? chat?.phone_number : null,
+    chatMatches ? chat?.phoneNumber : null,
+    contactMatches ? extractPhoneFromJid(contact?.remote_jid) : null,
+    chatMatches ? extractPhoneFromJid(chat?.remote_jid) : null,
     extractPhoneFromJid(rawJid),
   ];
 
@@ -331,31 +359,37 @@ export function resolveContactIdentity({
   const isLid = isLidJid(rawJid);
   const isGroup = isGroupJid(rawJid);
   const isBroadcast = isBroadcastJid(rawJid);
+  const contactMatches = !contact?.remote_jid || sameRemoteJid(contact.remote_jid, rawJid);
+  const chatMatches = !chat?.remote_jid || sameRemoteJid(chat.remote_jid, rawJid);
 
   const phoneNumber = resolvePhoneNumber(contact, chat, rawJid);
   const formattedPhone = phoneNumber ? formatBrazilianPhone(phoneNumber) : null;
 
   const nameCandidates = [
-    { value: contact?.display_name, source: 'display_name' },
-    { value: contact?.verified_name, source: 'verified_name' },
-    { value: contact?.business_name, source: 'business_name' },
-    { value: contact?.push_name, source: 'push_name' },
-    { value: chat?.chat_name, source: 'chat_name' },
-    { value: chat?.name, source: 'chat_name' },
-    { value: chat?.push_name, source: 'push_name' },
-    { value: message?.sender_name, source: 'sender_name' },
-    { value: message?.pushName, source: 'push_name' },
-    { value: message?.push_name, source: 'push_name' },
+    { value: contactMatches ? contact?.display_name : null, source: 'display_name', identitySource: 'contact_remote_jid' as const },
+    { value: contactMatches ? contact?.verified_name : null, source: 'verified_name', identitySource: 'contact_remote_jid' as const },
+    { value: contactMatches ? contact?.business_name : null, source: 'business_name', identitySource: 'contact_remote_jid' as const },
+    { value: contactMatches ? contact?.push_name : null, source: 'push_name', identitySource: 'contact_remote_jid' as const },
+    { value: chatMatches ? chat?.chat_name : null, source: 'chat_name', identitySource: 'chat_remote_jid' as const },
+    { value: chatMatches ? chat?.name : null, source: 'chat_name', identitySource: 'chat_remote_jid' as const },
+    { value: chatMatches ? chat?.push_name : null, source: 'push_name', identitySource: 'chat_remote_jid' as const },
+    { value: message?.sender_name, source: 'sender_name', identitySource: 'push_name' as const },
+    { value: message?.pushName, source: 'push_name', identitySource: 'push_name' as const },
+    { value: message?.push_name, source: 'push_name', identitySource: 'push_name' as const },
   ];
 
   let displayName = '';
   let displayNameSource = '';
+  let identitySource: WhatsAppIdentity['identitySource'] = 'fallback';
+  let identityConfidence: WhatsAppIdentity['identityConfidence'] = 'low';
 
   for (const candidate of nameCandidates) {
     const value = String(candidate.value || '').trim();
     if (isLikelyHumanName(value, { remoteJid: rawJid, phoneNumber })) {
       displayName = value;
       displayNameSource = candidate.source;
+      identitySource = candidate.identitySource || 'push_name';
+      identityConfidence = candidate.identitySource === 'contact_remote_jid' ? 'high' : 'medium';
       break;
     }
   }
@@ -364,6 +398,8 @@ export function resolveContactIdentity({
     if (formattedPhone) {
       displayName = formattedPhone;
       displayNameSource = 'phone';
+      identitySource = 'phone';
+      identityConfidence = rawJid.endsWith('@s.whatsapp.net') || rawJid.endsWith('@c.us') ? 'high' : 'medium';
     } else if (isGroup) {
       displayName = 'Grupo WhatsApp';
       displayNameSource = 'fallback';
@@ -374,14 +410,24 @@ export function resolveContactIdentity({
       const phone = extractPhoneFromJid(rawJid);
       displayName = phone ? formatBrazilianPhone(phone) : 'Contato WhatsApp';
       displayNameSource = phone ? 'jid_phone' : 'fallback';
+      identitySource = phone ? 'chat_remote_jid' : 'fallback';
+      identityConfidence = phone ? 'high' : 'low';
     } else {
       displayName = 'Contato WhatsApp';
       displayNameSource = 'fallback';
     }
   }
 
-  const profilePicUrl = contact?.profile_pic_url || chat?.profile_pic_url || null;
+  const profilePicUrl =
+    (contactMatches ? contact?.profile_pic_url : null) ||
+    (chatMatches ? chat?.profile_pic_url : null) ||
+    null;
   const send = resolveSendJid({ remoteJid: rawJid, phoneNumber });
+  const possibleWrongPhone = isLid && Boolean(contact?.phone_number || chat?.phone_number) && !phoneNumber;
+  const possibleWrongProfilePic =
+    Boolean(profilePicUrl) &&
+    Boolean(contact?.remote_jid) &&
+    !sameRemoteJid(contact.remote_jid, rawJid);
 
   return {
     displayName,
@@ -391,6 +437,10 @@ export function resolveContactIdentity({
     profilePicUrl,
     isLid,
     isGroup,
+    identityConfidence,
+    identitySource,
+    possibleWrongPhone,
+    possibleWrongProfilePic,
     canSendMessage: send.canSendMessage,
     sendJid: send.sendJid,
     sendStrategy: send.sendStrategy,

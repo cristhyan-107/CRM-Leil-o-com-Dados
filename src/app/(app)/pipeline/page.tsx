@@ -23,6 +23,8 @@ export default async function PipelinePage() {
     .from('whatsapp_chats')
     .select('id, remote_jid, chat_name, push_name, phone_number, last_message, last_message_at, pipeline_stage, unread_count, profile_pic_url')
     .eq('is_group', false)
+    .or('archived.is.false,archived.is.null')
+    .is('deleted_at', null)
     .order('last_message_at', { ascending: false });
 
   return (

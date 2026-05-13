@@ -6,10 +6,49 @@ import { resolveWhatsAppInstance } from '@/app/(app)/settings/whatsapp/actions';
 
 export const dynamic = 'force-dynamic';
 
+function hasRawJid(value: unknown) {
+  const text = String(value || '');
+  return (
+    text.includes('@s.whatsapp.net') ||
+    text.includes('@c.us') ||
+    text.includes('@g.us') ||
+    text.includes('@lid') ||
+    text.includes('@broadcast')
+  );
+}
+
+function buildDuplicateGroups(items: any[], key: 'phoneNumber' | 'profilePicUrl') {
+  const groups = new Map<string, any[]>();
+  for (const item of items) {
+    const value = String(item[key] || '').trim();
+    if (!value) continue;
+    const list = groups.get(value) || [];
+    list.push(item);
+    groups.set(value, list);
+  }
+
+  return [...groups.entries()]
+    .map(([value, list]) => ({
+      value,
+      count: list.length,
+      distinctRemoteJids: [...new Set(list.map((item) => item.chatRemoteJid))],
+      classification: list.some((item) => item.isLid) ? 'medium confidence suspicious' : 'low confidence, do not touch',
+      examples: list.slice(0, 5).map((item) => ({
+        chatId: item.chatId,
+        chatRemoteJid: item.chatRemoteJid,
+        contactRemoteJid: item.contactRemoteJid,
+        displayName: item.displayName,
+      })),
+    }))
+    .filter((group) => group.distinctRemoteJids.length > 1);
+}
+
 export async function GET(req: Request) {
   const supabase = await createServerSupabase();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 });
 
   const limit = Math.min(Number(new URL(req.url).searchParams.get('limit') || 30), 100);
   const admin = createAdminClient();
@@ -20,6 +59,8 @@ export async function GET(req: Request) {
     .select('id, instance_name, remote_jid, phone_number, chat_name, push_name, profile_pic_url, updated_at')
     .eq('user_id', user.id)
     .eq('instance_name', instanceName)
+    .or('archived.is.false,archived.is.null')
+    .is('deleted_at', null)
     .order('last_message_at', { ascending: false, nullsFirst: false })
     .limit(limit);
 
@@ -34,66 +75,62 @@ export async function GET(req: Request) {
     .in('remote_jid', remoteJids.length ? remoteJids : ['']);
   const contactByJid = new Map((contacts || []).map((c: any) => [c.remote_jid, c]));
 
-  let lidCount = 0;
-  let groupCount = 0;
-  let withPhone = 0;
-  let withDisplayName = 0;
-  let withProfilePic = 0;
-  let canSendMessageCount = 0;
   let rawJidWouldBeShown = 0;
+  let lidWithoutPhone = 0;
+  let chatsWithoutPhone = 0;
+  let chatsWithProfilePic = 0;
+  let lowConfidenceIdentities = 0;
 
   const items = (chats || []).map((chat: any) => {
     const contact = contactByJid.get(chat.remote_jid);
     const identity = resolveContactIdentity({ contact, chat, remoteJid: chat.remote_jid });
+    const uiWouldShowPrimary = identity.displayName;
+    const uiWouldShowSecondary = identity.formattedPhone || (identity.isLid ? 'Telefone nao identificado' : '');
+    const wouldShowRaw = hasRawJid(uiWouldShowPrimary) || hasRawJid(uiWouldShowSecondary);
 
-    if (identity.isLid) lidCount++;
-    if (identity.isGroup) groupCount++;
-    if (identity.phoneNumber) withPhone++;
-    if (identity.displayNameSource !== 'fallback' && identity.displayNameSource !== 'jid_phone') withDisplayName++;
-    if (identity.profilePicUrl) withProfilePic++;
-    if (identity.canSendMessage) canSendMessageCount++;
-
-    // Check if raw JID would leak into UI
-    const wouldShowRaw =
-      identity.displayName.includes('@s.whatsapp.net') ||
-      identity.displayName.includes('@c.us') ||
-      identity.displayName.includes('@g.us') ||
-      identity.displayName.includes('@lid') ||
-      identity.displayName.includes('@broadcast') ||
-      /^\d{10,}$/.test(identity.displayName.replace(/\D/g, ''));
-    if (wouldShowRaw) rawJidWouldBeShown++;
+    if (wouldShowRaw) rawJidWouldBeShown += 1;
+    if (identity.isLid && !identity.phoneNumber) lidWithoutPhone += 1;
+    if (!identity.phoneNumber) chatsWithoutPhone += 1;
+    if (identity.profilePicUrl) chatsWithProfilePic += 1;
+    if (identity.identityConfidence === 'low') lowConfidenceIdentities += 1;
 
     return {
       chatId: chat.id,
-      remoteJid: chat.remote_jid,
+      chatRemoteJid: chat.remote_jid,
+      contactRemoteJid: contact?.remote_jid || null,
+      isSameRemoteJid: Boolean(contact?.remote_jid && contact.remote_jid === chat.remote_jid),
       isLid: identity.isLid,
-      isGroup: identity.isGroup,
       displayName: identity.displayName,
       displayNameSource: identity.displayNameSource,
-      phoneNumber: identity.phoneNumber,
       formattedPhone: identity.formattedPhone,
+      phoneNumber: identity.phoneNumber,
       profilePicUrl: identity.profilePicUrl,
-      sendJid: identity.sendJid,
-      canSendMessage: identity.canSendMessage,
-      avatarFallback: identity.avatarFallback,
-      uiWouldShowPrimary: identity.displayName,
-      uiWouldShowSecondary: identity.formattedPhone || '',
+      identityConfidence: identity.identityConfidence,
+      identitySource: identity.identitySource,
+      possibleWrongPhone: identity.possibleWrongPhone,
+      possibleWrongProfilePic: identity.possibleWrongProfilePic,
+      uiWouldShowPrimary,
+      uiWouldShowSecondary,
       rawJidWouldBeShown: wouldShowRaw,
     };
   });
 
+  const duplicatePhoneGroups = buildDuplicateGroups(items, 'phoneNumber');
+  const duplicateProfilePicGroups = buildDuplicateGroups(items, 'profilePicUrl');
+
   return NextResponse.json({
     success: true,
-    items,
+    instanceName,
     summary: {
       total: items.length,
-      lidCount,
-      groupCount,
-      withPhone,
-      withDisplayName,
-      withProfilePic,
-      canSendMessage: canSendMessageCount,
       rawJidWouldBeShown,
+      duplicatePhoneGroups,
+      duplicateProfilePicGroups,
+      lidWithoutPhone,
+      chatsWithoutPhone,
+      chatsWithProfilePic,
+      lowConfidenceIdentities,
     },
+    items,
   });
 }

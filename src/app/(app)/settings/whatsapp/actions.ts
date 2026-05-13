@@ -487,7 +487,7 @@ function chatToRow(userId: string, instanceName: string, chat: EvolutionChat) {
 }
 
 function contactToRow(userId: string, instanceName: string, contact: EvolutionContact) {
-  const phone = contact.phoneNumber || jidToPhone(contact.remoteJid);
+  const phone = isLidJid(contact.remoteJid) ? '' : contact.phoneNumber || jidToPhone(contact.remoteJid);
   const identity = resolveContactIdentity({
     contact: {
       ...contact,
@@ -1121,6 +1121,8 @@ export async function getInboxContacts(): Promise<any[]> {
       .eq('user_id', user.id)
       .eq('instance_name', instanceName)
       .eq('is_group', false)
+      .or('archived.is.false,archived.is.null')
+      .is('deleted_at', null)
       .order('last_message_at', { ascending: false, nullsFirst: false })
       .limit(100);
 
@@ -1137,20 +1139,14 @@ export async function getInboxContacts(): Promise<any[]> {
     }
     const contactByJid = new Map((contacts || []).map((contact: any) => [contact.remote_jid, contact]));
 
-    // For @lid chats: build a broader contact lookup by phone number
-    // Since @lid chats have contacts stored under @s.whatsapp.net JIDs,
-    // we need to cross-reference via phone_number
     const lidChats = data.filter((chat: any) => chat.remote_jid?.endsWith('@lid'));
-    let contactByPhone = new Map<string, any>();
-    const phoneByLid = new Map<string, string>();
-    const profilePicByLid = new Map<string, string>();
     
     if (lidChats.length > 0) {
-      // Fetch push_names from messages for @lid chats (the best identity hint we have)
+      // Fetch push_names from messages for @lid chats. This uses only the same remote_jid.
       const lidJids = lidChats.map((c: any) => c.remote_jid);
       const { data: lidMsgNames } = await admin
         .from('whatsapp_messages')
-        .select('remote_jid, push_name, sender_name, phone_normalized, raw_payload')
+        .select('remote_jid, push_name, sender_name, phone_normalized')
         .eq('user_id', user.id)
         .eq('instance_name', instanceName)
         .in('remote_jid', lidJids)
@@ -1168,40 +1164,12 @@ export async function getInboxContacts(): Promise<any[]> {
         if (isLikelyHumanName(name, { remoteJid: jid, phoneNumber: msg.phone_normalized })) {
           lidPushNames.set(jid, name);
         }
-        const altPhone = extractPhoneFromJid((msg as any)?.raw_payload?.key?.remoteJidAlt);
-        const normalizedPhone = String((msg as any).phone_normalized || '').replace(/\D/g, '');
-        const phone = altPhone || (
-          isValidPhoneNumber(normalizedPhone) && !normalizedPhone.includes(jid.split('@')[0])
-            ? normalizedPhone
-            : ''
-        );
-        if (phone && !phoneByLid.has(jid)) phoneByLid.set(jid, phone);
-      }
-
-      // Build phone-to-contact map for ALL contacts in this instance
-      const { data: allContacts, error: allContactsError } = await admin
-        .from('whatsapp_contacts')
-        .select('remote_jid, display_name, push_name, verified_name, business_name, phone_number, profile_pic_url')
-        .eq('user_id', user.id)
-        .eq('instance_name', instanceName)
-        .not('phone_number', 'is', null);
-      if (allContactsError) {
-        console.error('[getInboxContacts] all contacts lookup failed:', allContactsError.message);
-      }
-      
-      for (const c of allContacts || []) {
-        const phone = String(c.phone_number || '').replace(/\D/g, '');
-        if (phone && isValidPhoneNumber(phone)) contactByPhone.set(phone, c);
       }
 
       // Enrich @lid chats with push_name from messages
       for (const chat of lidChats) {
         const pushName = lidPushNames.get(chat.remote_jid);
-        const mappedPhone = phoneByLid.get(chat.remote_jid);
-        if (mappedPhone && !chat.phone_number) chat.phone_number = mappedPhone;
-        const mappedContact = mappedPhone ? contactByPhone.get(mappedPhone) : null;
-        if (mappedContact?.profile_pic_url) profilePicByLid.set(chat.remote_jid, mappedContact.profile_pic_url);
-        if (pushName && (!chat.chat_name || !isLikelyHumanName(chat.chat_name, { remoteJid: chat.remote_jid, phoneNumber: mappedPhone }))) {
+        if (pushName && (!chat.chat_name || !isLikelyHumanName(chat.chat_name, { remoteJid: chat.remote_jid }))) {
           chat.chat_name = pushName;
           chat.push_name = pushName;
         }
@@ -1209,29 +1177,9 @@ export async function getInboxContacts(): Promise<any[]> {
     }
 
     return data.map((chat: any) => {
-      let contact = contactByJid.get(chat.remote_jid);
-      
-      // For @lid chats without a direct contact match, try phone-based lookup
-      if (!contact && chat.remote_jid?.endsWith('@lid')) {
-        const mappedPhone = phoneByLid.get(chat.remote_jid);
-        if (mappedPhone) contact = contactByPhone.get(mappedPhone);
-        // Try to find contact by matching push_name/chat_name
-        if (!contact) {
-          for (const [, c] of contactByPhone) {
-            if (c.display_name && chat.chat_name && c.display_name === chat.chat_name) {
-              contact = c;
-              break;
-            }
-            if (c.push_name && chat.push_name && c.push_name === chat.push_name) {
-              contact = c;
-              break;
-            }
-          }
-        }
-      }
-      
+      const contact = contactByJid.get(chat.remote_jid);
       const identity = resolveContactIdentity({ contact, chat, remoteJid: chat.remote_jid });
-      const profilePicUrl = identity.profilePicUrl || profilePicByLid.get(chat.remote_jid) || null;
+      const profilePicUrl = identity.profilePicUrl || null;
       return {
         id: chat.id,
         phone: identity.formattedPhone || '',
@@ -1251,6 +1199,10 @@ export async function getInboxContacts(): Promise<any[]> {
         isLead: false,
         isLid: identity.isLid,
         isGroup: identity.isGroup,
+        identityConfidence: identity.identityConfidence,
+        identitySource: identity.identitySource,
+        possibleWrongPhone: identity.possibleWrongPhone,
+        possibleWrongProfilePic: identity.possibleWrongProfilePic,
         canSendMessage: identity.canSendMessage,
         sendJid: identity.sendJid,
       };

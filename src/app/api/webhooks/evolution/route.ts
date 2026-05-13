@@ -8,6 +8,7 @@ import {
   getMessageMediaInfo,
   isBroadcastJid,
   isGroupJid,
+  isLidJid,
   normalizeEvolutionEventName,
   normalizeWhatsAppJid,
   resolveContactDisplayName,
@@ -249,6 +250,7 @@ async function saveEvolutionMessage(
     message?.key?.id ||
     stableMessageId([instanceName, remoteJid, timestamp, fromMe, messageType, text, media.mimetype]);
   const phone = extractPhoneFromJid(message?.key?.remoteJidAlt || remoteJid);
+  const identityPhone = isLidJid(remoteJid) ? null : phone;
   const rawSenderName = message?.pushName || message?.senderName || null;
   // Filter out LID numbers that Evolution sometimes sends as pushName
   const senderName = (rawSenderName && /^\d{10,}$/.test(rawSenderName)) ? null : rawSenderName;
@@ -259,7 +261,7 @@ async function saveEvolutionMessage(
   }
 
   const displayName = resolveContactDisplayName({
-    contact: { push_name: senderName, phone_number: phone },
+    contact: { push_name: senderName, phone_number: identityPhone },
     message,
     remoteJid,
   });
@@ -269,7 +271,7 @@ async function saveEvolutionMessage(
       user_id: userId,
       instance_name: instanceName,
       remote_jid: remoteJid,
-      phone_number: phone || null,
+      phone_number: identityPhone || null,
       display_name: displayName,
       push_name: senderName,
       is_group: isGroupJid(remoteJid),
@@ -321,7 +323,7 @@ async function saveEvolutionMessage(
       user_id: userId,
       instance_name: instanceName,
       remote_jid: remoteJid,
-      phone_number: phone || null,
+      phone_number: identityPhone || null,
       chat_name: displayName,
       push_name: displayName,
       last_message: lastMessageText || null,
